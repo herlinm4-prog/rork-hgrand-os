@@ -57,7 +57,7 @@ interface VoiceConversationProps {
   onClose: () => void;
   systemContext: string;
   students: Array<{ id: string; name: string }>;
-  onCoachMessage: (text: string) => Promise<string>;
+  onCoachMessage: (text: string, onPartial?: (chunkText: string) => void) => Promise<string>;
   voiceSettings: VoiceSettings;
   onOpenSettings: () => void;
 }
@@ -115,6 +115,15 @@ export function VoiceConversation({
   studentsRef.current = students;
   const voiceSettingsRef = useRef(voiceSettings);
   voiceSettingsRef.current = voiceSettings;
+
+  // ── Progressive speech queue ────────────────────────────────────────
+  // Sentences arrive from onCoachMessage as soon as they're generated
+  // (not after the whole reply is done) and are spoken in order here —
+  // this is what gives Sol a fluid, "thinking out loud" feel instead of
+  // a long silent pause followed by one big block of speech.
+  const speechQueueRef = useRef<string[]>([]);
+  const speechQueueActiveRef = useRef(false);
+  const speechDoneRef = useRef(false);
 
   // Fade-in animation for the entire modal
   const fadeIn = useRef(new Animated.Value(0)).current;
@@ -203,6 +212,36 @@ export function VoiceConversation({
     if (bargeMonitorRef.current) {
       clearInterval(bargeMonitorRef.current);
       bargeMonitorRef.current = null;
+    }
+  }, []);
+
+  // ── Progressive speech queue runner ──────────────────────────────
+  // Pulls sentences off the queue one at a time and speaks them in
+  // order, as soon as they're available — while the AI may still be
+  // generating the rest of the reply in the background.
+  const runSpeechQueue = useCallback(async () => {
+    if (speechQueueActiveRef.current) return;
+    speechQueueActiveRef.current = true;
+    try {
+      while (true) {
+        if (!isMountedRef.current) break;
+        if (speechQueueRef.current.length === 0) {
+          if (speechDoneRef.current) break;
+          await new Promise((r) => setTimeout(r, 60));
+          continue;
+        }
+        const chunk = speechQueueRef.current.shift()!;
+        const vs = voiceSettingsRef.current;
+        const voiceId = getVoiceIdFromPreset(vs.voicePresetId);
+        const speed = vs.speed as VoiceSpeed;
+        const result = await speakStreaming(chunk, undefined, voiceId, speed);
+        if (result === 'interrupted') {
+          speechQueueRef.current = [];
+          break;
+        }
+      }
+    } finally {
+      speechQueueActiveRef.current = false;
     }
   }, []);
 
@@ -325,10 +364,44 @@ export function VoiceConversation({
       }
     }
 
-    // Get AI response
+    // Get AI response — speak each sentence as soon as it's ready instead
+    // of waiting for the full reply, so Sol feels like she's talking in
+    // real time rather than pausing then dumping one long block of audio.
     setPipelineStep('Sol está pensando...');
     try {
-      const aiResponse = await onCoachMessage(transcript);
+      setPhase('speaking');
+      setIsStreamingAI(true);
+      setPipelineStep('Reproduciendo respuesta...');
+
+      stopBargeMonitoring();
+      await stopAllInternal();
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      speechQueueRef.current = [];
+      speechDoneRef.current = false;
+
+      const handlePartial = (chunkText: string) => {
+        if (!isMountedRef.current) return;
+        setStreamingText((prev) => (prev ? prev + ' ' + chunkText : chunkText));
+        speechQueueRef.current.push(chunkText);
+        void runSpeechQueue();
+      };
+
+      const aiResponse = await onCoachMessage(transcript, handlePartial);
+      speechDoneRef.current = true;
+
+      // Let any queued sentences finish playing before moving on
+      while (isMountedRef.current && (speechQueueActiveRef.current || speechQueueRef.current.length > 0)) {
+        await new Promise((r) => setTimeout(r, 80));
+      }
+
       if (!isMountedRef.current) return;
 
       const aiTurn: VoiceTurn = { role: 'assistant', text: aiResponse, timestamp: Date.now() };
@@ -358,36 +431,11 @@ export function VoiceConversation({
         }
       }
 
-      if (!isMountedRef.current) return;
-      setPhase('speaking');
-      setIsStreamingAI(true);
-      setPipelineStep('Reproduciendo respuesta...');
-
-      stopBargeMonitoring();
-      await stopAllInternal();
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-      });
-
-      const vs = voiceSettingsRef.current;
-      const voiceId = getVoiceIdFromPreset(vs.voicePresetId);
-      const speed = vs.speed as VoiceSpeed;
-
-      const ttsResult = await speakStreaming(aiResponse, (_chunkIndex, chunkText, _total) => {
-        if (!isMountedRef.current) return;
-        setStreamingText((prev) => prev + chunkText + ' ');
-      }, voiceId, speed);
-
       setIsStreamingAI(false);
-
-      if (ttsResult === 'interrupted') return;
     } catch (err) {
       console.log('[VoiceConv] AI/TTS error:', String(err));
+      speechDoneRef.current = true;
+      speechQueueRef.current = [];
       if (isMountedRef.current) {
         setErrorMsg('La voz no está disponible, pero puedes leer mi respuesta arriba.');
       }
@@ -405,7 +453,7 @@ export function VoiceConversation({
         if (isMountedRef.current && phaseRef.current === 'idle') startListening();
       }, 600);
     }
-  }, [onCoachMessage, startListening, stopAllInternal, startBargeMonitoring, stopBargeMonitoring]);
+  }, [onCoachMessage, startListening, stopAllInternal, startBargeMonitoring, stopBargeMonitoring, runSpeechQueue]);
 
   processVoiceInputRef.current = processVoiceInput;
 
