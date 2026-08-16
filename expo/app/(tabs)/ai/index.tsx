@@ -67,6 +67,7 @@ import { QuickToolsBar } from '@/components/ai/QuickToolsBar';
 import { ConversationModeSelector } from '@/components/ai/ConversationModeSelector';
 import { PhotoComparisonView } from '@/components/ai/PhotoComparisonView';
 import { VoiceConversation } from '@/components/ai/VoiceConversation';
+import { detectAthleteContext } from '@/utils/voiceService';
 import { VoiceSettingsSheet } from '@/components/ai/VoiceSettingsSheet';
 import { StreamingText } from '@/components/ai/StreamingText';
 import { DraftDocumentCard, type DraftNutritionPlan, type DraftMeal, type DraftFood } from '@/components/ai/DraftDocumentCard';
@@ -1711,11 +1712,45 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
   const systemContextRef = useRef(systemContext);
   systemContextRef.current = systemContext;
 
-  /** Called by VoiceConversation when coach finishes speaking */
-  const handleVoiceCoachMessage = useCallback(async (text: string): Promise<string> => {
+  /**
+   * Called by VoiceConversation when coach finishes speaking.
+   * `onPartial` (optional) is invoked with each newly-completed sentence as
+   * soon as it's ready, so the caller can start speaking it immediately
+   * instead of waiting for the whole response — this is what makes the
+   * voice mode feel fluid/real-time instead of "record → wait → play".
+   */
+  const handleVoiceCoachMessage = useCallback(async (
+    text: string,
+    onPartial?: (chunkText: string) => void,
+  ): Promise<string> => {
     const currentMsgs = messagesRef.current;
     const isFirstMessage = currentMsgs.length === 0;
-    const finalText = isFirstMessage ? `${systemContextRef.current}\n\n${text}` : text;
+
+    // ── Auto-inject the athlete's full linear memory (since day one) ────
+    // Instead of depending on the AI deciding to call getAthleteMemory,
+    // we fetch it directly whenever an athlete is named in the transcript,
+    // so Sol always has continuity across sessions in voice mode.
+    let memoryBlock = '';
+    try {
+      const athleteIds = detectAthleteContext(text, students);
+      const athlete = students.find((s) => athleteIds.includes(s.id));
+      if (athlete) {
+        const memory = await fetchAthleteMemory(athlete.id);
+        if (memory.length > 0) {
+          const recent = memory.slice(-12);
+          const digest = recent
+            .map((e) => `- [${e.date.substring(0, 10)}] (${e.type}) ${e.title}: ${e.description}`)
+            .join('\n');
+          memoryBlock = `\n\n[MEMORIA LINEAL DE ${athlete.name.toUpperCase()} — desde el día uno, ${memory.length} eventos totales, últimos ${recent.length}:\n${digest}\nUsa este historial para dar continuidad real. No repitas preguntas ya respondidas antes ni sugieras algo que ya se descartó.]`;
+        }
+      }
+    } catch (memErr) {
+      console.log('[VoiceAPI] Memory fetch failed (non-blocking):', String(memErr).substring(0, 150));
+    }
+
+    const finalText = isFirstMessage
+      ? `${systemContextRef.current}\n\n${text}${memoryBlock}`
+      : `${text}${memoryBlock}`;
 
     console.log('[VoiceAPI] Sending voice message to AI:', finalText.substring(0, 100));
     console.log('[VoiceAPI] Current messages count:', currentMsgs.length);
@@ -1729,11 +1764,41 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         .trim();
     };
 
-    // Return a promise that resolves with the AI response text
+    // Return a promise that resolves with the FULL final AI response text.
+    // Partial sentences are streamed out via onPartial as they complete.
     return new Promise<string>((resolve) => {
       const prevLength = currentMsgs.length;
       let pollCount = 0;
+      let emittedLength = 0; // how much of the growing response has already gone to TTS
       const startTime = Date.now();
+
+      const emitNewSentences = (fullSoFar: string, flushAll: boolean) => {
+        if (!onPartial) return;
+        const unspoken = fullSoFar.slice(emittedLength);
+        if (!unspoken) return;
+        if (flushAll) {
+          const rest = unspoken.trim();
+          if (rest) onPartial(rest);
+          emittedLength = fullSoFar.length;
+          return;
+        }
+        // Only emit complete sentences; keep the trailing partial one buffered
+        const match = unspoken.match(/^[\s\S]*?[.!?](?:\s+|$)/);
+        if (match && match[0]) {
+          const complete = match[0].trim();
+          if (complete) onPartial(complete);
+          emittedLength += match[0].length;
+        }
+      };
+
+      const getGrowingText = (msgs: any[]) =>
+        msgs
+          .slice(prevLength)
+          .filter((m: any) => m.role === 'assistant')
+          .map((m: any) => extractText(m.parts || []))
+          .join('\n')
+          .trim();
+
       agentSendMessage(finalText);
 
       // Poll for new messages — uses refs to always read fresh state
@@ -1741,73 +1806,42 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         pollCount++;
         const msgs = messagesRef.current;
         const streaming = isStreamingRef.current;
+        const growing = getGrowingText(msgs);
 
-        // Check all messages from prevLength onward for assistant with text
-        for (let i = prevLength; i < msgs.length; i++) {
-          const msg = msgs[i] as any;
-          if (msg.role === 'assistant') {
-            const textContent = extractText(msg.parts || []);
-            if (textContent && textContent.length > 10) {
-              console.log('[VoiceAPI] Found assistant text at message', i, 'after', pollCount, 'polls (', Date.now() - startTime, 'ms). Preview:', textContent.substring(0, 100));
-              clearInterval(checkInterval);
-              resolve(textContent);
-              return;
-            }
-          }
-        }
+        if (growing) emitNewSentences(growing, false);
 
-        // Fallback: streaming ended, check if last message has content
-        if (!streaming && msgs.length > prevLength) {
-          const lastMsg = msgs[msgs.length - 1] as any;
-          if (lastMsg?.role === 'assistant') {
-            const textContent = extractText(lastMsg.parts || []);
-            if (textContent) {
-              console.log('[VoiceAPI] Resolved from fallback after', pollCount, 'polls. Preview:', textContent.substring(0, 100));
-              clearInterval(checkInterval);
-              resolve(textContent);
-              return;
-            }
-          }
-          // Also check any assistant message for partial text
-          for (let i = msgs.length - 1; i >= prevLength; i--) {
-            const msg = msgs[i] as any;
-            if (msg.role === 'assistant') {
-              const textContent = extractText(msg.parts || []);
-              if (textContent) {
-                console.log('[VoiceAPI] Resolved from reverse scan after', pollCount, 'polls.');
-                clearInterval(checkInterval);
-                resolve(textContent);
-                return;
-              }
-            }
-          }
+        // Only resolve once the agent has actually finished — resolving on a
+        // partial mid-stream chunk was cutting Sol's answers short.
+        if (!streaming && msgs.length > prevLength && growing) {
+          console.log('[VoiceAPI] Response complete after', pollCount, 'polls (', Date.now() - startTime, 'ms). Preview:', growing.substring(0, 100));
+          clearInterval(checkInterval);
+          emitNewSentences(growing, true);
+          resolve(growing);
+          return;
         }
 
         if (pollCount % 10 === 0) {
           console.log('[VoiceAPI] Still polling... count:', pollCount, 'streaming:', streaming, 'msgs:', msgs.length);
         }
-      }, 300);
+      }, 250);
 
-      // Safety timeout: 45 seconds (reduced from 60)
+      // Safety timeout: 45 seconds
       setTimeout(() => {
         clearInterval(checkInterval);
         console.log('[VoiceAPI] TIMEOUT after 45s — resolving with fallback');
-        // Last attempt: grab text from any assistant message
         const msgs = messagesRef.current;
-        for (let i = msgs.length - 1; i >= prevLength; i--) {
-          const msg = msgs[i] as any;
-          if (msg.role === 'assistant') {
-            const textContent = extractText(msg.parts || []);
-            if (textContent) {
-              resolve(textContent);
-              return;
-            }
-          }
+        const growing = getGrowingText(msgs);
+        if (growing) {
+          emitNewSentences(growing, true);
+          resolve(growing);
+          return;
         }
-        resolve('Lo siento, no pude procesar tu mensaje a tiempo. ¿Puedes repetirlo?');
+        const fallback = 'Lo siento, no pude procesar tu mensaje a tiempo. ¿Puedes repetirlo?';
+        onPartial?.(fallback);
+        resolve(fallback);
       }, 45000);
     });
-  }, [agentSendMessage]);
+  }, [agentSendMessage, students]);
 
   const openSaveModal = useCallback((content: string) => {
     setSaveContent(content); setSaveDocName(`AI - ${new Date().toLocaleDateString('es')}`);
