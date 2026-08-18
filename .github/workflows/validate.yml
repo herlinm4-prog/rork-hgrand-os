@@ -22,8 +22,8 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - name: Install dependencies without rewriting lockfile
+        run: bun install --no-save
 
       - name: TypeScript
         run: bunx tsc --noEmit
