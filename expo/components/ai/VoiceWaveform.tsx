@@ -1,51 +1,41 @@
 // components/ai/VoiceWaveform.tsx
-// Neural waveform — 7 dynamic bars that react to mic intensity and phase.
-// Bio-inspired aesthetic: like a heartbeat monitor meets audio visualizer.
+// Neural waveform — dynamic bars that react to mic intensity and phase.
 
-import React, { useRef, useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { View, Animated, StyleSheet } from 'react-native';
 import type { VoicePhase } from './VoiceConversation';
 
 interface VoiceWaveformProps {
   phase: VoicePhase;
-  micLevel: number; // 0-1
+  micLevel: number;
   barCount?: number;
 }
 
 const PHASE_COLORS: Record<VoicePhase, string> = {
-  idle:       'rgba(229,72,77,0.2)',
-  listening:  '#34C759',
-  thinking:   '#FF9F0A',
-  speaking:   '#E5484D',
-  interrupted:'#FF9F0A',
+  idle: 'rgba(229,72,77,0.2)',
+  listening: '#34C759',
+  thinking: '#FF9F0A',
+  speaking: '#E5484D',
+  interrupted: '#FF9F0A',
 };
 
-// Pre-compute slightly different heights for natural asymmetry
 const BASE_HEIGHTS = [0.6, 0.35, 0.8, 0.5, 0.9, 0.4, 0.7];
 
 export function VoiceWaveform({ phase, micLevel, barCount = 7 }: VoiceWaveformProps) {
   const color = PHASE_COLORS[phase] || PHASE_COLORS.idle;
 
+  // Animated.Value is not a hook. Creating the values inside useMemo keeps a
+  // stable array for a given bar count while respecting the Rules of Hooks.
   const barAnims = useMemo(
-    () => Array.from({ length: barCount }, () => useRef(new Animated.Value(BASE_HEIGHTS[0] ?? 0.5)).current),
+    () => Array.from(
+      { length: barCount },
+      (_, index) => new Animated.Value((BASE_HEIGHTS[index % BASE_HEIGHTS.length] ?? 0.5) * 2),
+    ),
     [barCount],
   );
 
   useEffect(() => {
     if (phase === 'listening') {
-      // Each bar animates independently based on mic level + base height
-      const animations = barAnims.map((anim, i) => {
-        const baseH = BASE_HEIGHTS[i % BASE_HEIGHTS.length] ?? 0.5;
-        const target = baseH * 4 + micLevel * 32 + Math.random() * 8;
-        return Animated.spring(anim, {
-          toValue: target,
-          friction: 6 + Math.random() * 4,
-          tension: 40 + Math.random() * 30,
-          useNativeDriver: false,
-        });
-      });
-
-      // Run continuously by looping individual bars
       const loops = barAnims.map((anim, i) => {
         const baseH = BASE_HEIGHTS[i % BASE_HEIGHTS.length] ?? 0.5;
         return Animated.loop(
@@ -64,16 +54,14 @@ export function VoiceWaveform({ phase, micLevel, barCount = 7 }: VoiceWaveformPr
         );
       });
 
-      loops.forEach((l) => l.start());
-
+      loops.forEach((loop) => loop.start());
       return () => {
-        loops.forEach((l) => l.stop());
-        barAnims.forEach((a) => a.stopAnimation());
+        loops.forEach((loop) => loop.stop());
+        barAnims.forEach((anim) => anim.stopAnimation());
       };
     }
 
     if (phase === 'thinking') {
-      // Slow, thought-like wave
       barAnims.forEach((anim, i) => {
         const baseH = BASE_HEIGHTS[i % BASE_HEIGHTS.length] ?? 0.5;
         Animated.loop(
@@ -94,7 +82,6 @@ export function VoiceWaveform({ phase, micLevel, barCount = 7 }: VoiceWaveformPr
     }
 
     if (phase === 'speaking') {
-      // Warm, flowing wave — Sol is talking
       barAnims.forEach((anim, i) => {
         const baseH = BASE_HEIGHTS[i % BASE_HEIGHTS.length] ?? 0.5;
         Animated.loop(
@@ -116,8 +103,7 @@ export function VoiceWaveform({ phase, micLevel, barCount = 7 }: VoiceWaveformPr
       });
     }
 
-    if (phase === 'idle') {
-      // Reset to base
+    if (phase === 'idle' || phase === 'interrupted') {
       barAnims.forEach((anim, i) => {
         const baseH = BASE_HEIGHTS[i % BASE_HEIGHTS.length] ?? 0.5;
         Animated.spring(anim, {
@@ -130,7 +116,7 @@ export function VoiceWaveform({ phase, micLevel, barCount = 7 }: VoiceWaveformPr
     }
 
     return () => {
-      barAnims.forEach((a) => a.stopAnimation());
+      barAnims.forEach((anim) => anim.stopAnimation());
     };
   }, [phase, micLevel, barAnims]);
 
