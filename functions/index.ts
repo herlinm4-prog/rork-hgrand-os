@@ -16,14 +16,14 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Rork-User-Id",
 };
 
-function withCors(response: Response): Promise<Response> {
-  return response.text().then((body) => new Response(body, {
+async function withCors(response: Response): Promise<Response> {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(CORS)) headers.set(key, value);
+  return new Response(await response.arrayBuffer(), {
     status: response.status,
-    headers: {
-      ...CORS,
-      "Content-Type": response.headers.get("Content-Type") ?? "application/json",
-    },
-  }));
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function coachIdFrom(request: Request): string {
@@ -64,7 +64,10 @@ async function handleNutritionPlanRoute(
   studentUrl.search = "";
 
   if (method === "GET") {
-    const response = await forwardToCoachData(request, env, studentUrl, { method: "GET", headers: request.headers });
+    const response = await forwardToCoachData(request, env, studentUrl, {
+      method: "GET",
+      headers: request.headers,
+    });
     if (!response.ok) return response;
     const student = await response.json() as Record<string, unknown>;
     return Response.json(student.nutritionPlan ?? null);
@@ -72,19 +75,25 @@ async function handleNutritionPlanRoute(
 
   if (method === "PUT") {
     const nutritionPlan = await request.json();
-    return forwardToCoachData(request, env, studentUrl, {
+    const response = await forwardToCoachData(request, env, studentUrl, {
       method: "PUT",
       headers: request.headers,
       body: JSON.stringify({ nutritionPlan }),
     });
+    if (!response.ok) return response;
+    // Keep the API contract expected by expo/utils/api.ts: a NutritionPlan,
+    // not the full Student returned internally by CoachData.#updateStudent.
+    return Response.json(nutritionPlan);
   }
 
   if (method === "DELETE") {
-    return forwardToCoachData(request, env, studentUrl, {
+    const response = await forwardToCoachData(request, env, studentUrl, {
       method: "PUT",
       headers: request.headers,
       body: JSON.stringify({ nutritionPlan: null }),
     });
+    if (!response.ok) return response;
+    return Response.json({ ok: true });
   }
 
   return Response.json({ error: "method not allowed" }, { status: 405 });
@@ -200,8 +209,6 @@ export default {
       return withCors(await handleRealtimeCall(request, env));
     }
 
-    // Compatibility route: the client already exposes nutrition-plan APIs, but
-    // CoachData historically stored the active plan inside the student object.
     const nutritionMatch = url.pathname.match(/^\/api\/students\/([^/]+)\/nutrition-plan$/);
     if (nutritionMatch) {
       return withCors(await handleNutritionPlanRoute(request, env, nutritionMatch[1]));
