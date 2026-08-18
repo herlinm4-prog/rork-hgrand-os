@@ -23,7 +23,9 @@ import type {
   HealthAlert,
 } from "@/types";
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
+const RAW_BACKEND_URL = process.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
+const BACKEND_URL = RAW_BACKEND_URL?.replace(/\/$/, "");
+const API_TIMEOUT_MS = 20000;
 
 if (!BACKEND_URL) {
   console.warn(
@@ -31,31 +33,60 @@ if (!BACKEND_URL) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Internal fetch helper
-// ---------------------------------------------------------------------------
+function createClientId(prefix: string): string {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${prefix}_${Date.now()}_${random}`;
+}
 
 async function apiFetch<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const url = `${BACKEND_URL}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status} on ${path}: ${body}`);
+  if (!BACKEND_URL) {
+    throw new Error("HGRAND backend URL is not configured");
   }
 
-  const text = await res.text();
-  if (!text) return undefined as unknown as T;
-  return JSON.parse(text) as T;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const externalSignal = options.signal;
+  const abortFromExternal = () => controller.abort();
+  externalSignal?.addEventListener?.("abort", abortFromExternal, { once: true });
+
+  try {
+    const url = `${BACKEND_URL}${path}`;
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `API ${res.status} on ${path}${body ? `: ${body.substring(0, 500)}` : ""}`
+      );
+    }
+
+    const text = await res.text();
+    if (!text) return undefined as unknown as T;
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`API returned invalid JSON on ${path}`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`API timeout on ${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    externalSignal?.removeEventListener?.("abort", abortFromExternal);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,9 +404,16 @@ export async function recordMemoryEvent(
   studentId: string,
   event: Omit<AthleteMemoryEvent, "id">
 ): Promise<AthleteMemoryEvent> {
+  // Generate collision-resistant IDs client-side so the backend never needs to
+  // fall back to Date.now() for normal app-originated memory events.
+  const payload = {
+    ...event,
+    id: createClientId("mem"),
+  };
+
   return apiFetch<AthleteMemoryEvent>(
     `/api/students/${studentId}/memory`,
-    { method: "POST", body: JSON.stringify(event) }
+    { method: "POST", body: JSON.stringify(payload) }
   );
 }
 
@@ -580,8 +618,13 @@ export async function fetchStudentConversationTranscripts(
 export async function saveConversationTranscript(
   transcript: Omit<ConversationTranscript, "id">
 ): Promise<ConversationTranscript> {
+  const payload = {
+    ...transcript,
+    id: createClientId("conv"),
+  };
+
   return apiFetch<ConversationTranscript>("/api/conversation-transcripts", {
     method: "POST",
-    body: JSON.stringify(transcript),
+    body: JSON.stringify(payload),
   });
 }
