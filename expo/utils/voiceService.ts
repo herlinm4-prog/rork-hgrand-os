@@ -1,6 +1,6 @@
 // utils/voiceService.ts — HGRAND Neural Voice Engine
-// Streaming TTS, silence detection, barge-in support, audio metering.
-// ElevenLabs Flash v2.5 via Rork proxy for sub-400ms first-chunk latency.
+// Low-latency chunked TTS, silence detection, cancellation, audio metering,
+// resilient STT upload, and athlete-context detection.
 
 import { Audio } from 'expo-av';
 import { Platform } from 'react-native';
@@ -10,38 +10,40 @@ import { VOICE_PRESETS, VOICE_SPEED_SETTINGS, type VoiceSpeed } from '@/types/se
 const TOOLKIT_URL = process.env.EXPO_PUBLIC_TOOLKIT_URL || 'https://toolkit.rork.com';
 const TOOLKIT_KEY = process.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY || '';
 
+const TTS_TIMEOUT_MS = 15000;
+const STT_TIMEOUT_MS = 20000;
+
 // ---------------------------------------------------------------------------
 // Voice IDs
 // ---------------------------------------------------------------------------
 
-/** Sol's voice — warm, intimate, natural Spanish female (Matilda) */
+/** Sol's default voice. */
 const VOICE_ID_SOL = 'XrExE9yKIg1WjnnlVkGX';
 
-/** Get voice ID from preset ID */
 export function getVoiceIdFromPreset(presetId: string): string {
   const preset = VOICE_PRESETS.find((p) => p.id === presetId);
   return preset?.voiceId ?? VOICE_ID_SOL;
 }
 
-/** Get ElevenLabs voice settings from speed preference */
 export function getVoiceSettingsFromSpeed(speed: VoiceSpeed) {
   return VOICE_SPEED_SETTINGS[speed] ?? VOICE_SPEED_SETTINGS.normal;
 }
 
 // ---------------------------------------------------------------------------
-// TTS — streaming sentence-by-sentence via ElevenLabs Flash v2.5
+// TTS — sentence chunks with one-chunk-ahead prefetch
 // ---------------------------------------------------------------------------
 
 let currentSound: Audio.Sound | null = null;
-let isBargedIn = false;
 
 /**
- * Split text into natural sentence-like chunks for streaming TTS.
- * Splits on sentence boundaries, keeping chunks under ~200 chars for low latency.
+ * Monotonic cancellation token. stopSpeech() increments it, invalidating every
+ * synth/play operation that started before the interruption. Unlike a global
+ * boolean, a later speak call cannot accidentally "un-cancel" an older one.
  */
+let speechGeneration = 0;
+
 export function chunkForStreamingTTS(text: string): string[] {
   const chunks: string[] = [];
-  // Split on sentence endings: . ! ? \n  and also on ; — like natural pauses
   const rawChunks = text.split(/(?<=[.!?\n;])\s+/);
 
   let buffer = '';
@@ -56,105 +58,107 @@ export function chunkForStreamingTTS(text: string): string[] {
       buffer += (buffer ? ' ' : '') + trimmed;
     }
   }
-  if (buffer.trim()) {
-    chunks.push(buffer.trim());
-  }
 
-  // If still empty, return the whole text as one chunk
-  if (chunks.length === 0 && text.trim()) {
-    return [text.trim()];
-  }
-
+  if (buffer.trim()) chunks.push(buffer.trim());
+  if (chunks.length === 0 && text.trim()) return [text.trim()];
   return chunks;
 }
 
-/**
- * Synthesize a single chunk of text to speech.
- * Returns a base64 data URI to the MP3 audio.
- */
-async function synthesizeChunk(text: string, voiceId: string = VOICE_ID_SOL, speed?: VoiceSpeed): Promise<string> {
-  const url = `${TOOLKIT_URL}/v2/elevenlabs/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`;
-  const voiceSettings = getVoiceSettingsFromSpeed(speed ?? 'normal');
-
-  console.log('[VoiceService] Synthesizing chunk:', text.substring(0, 80), '| voice:', voiceId);
-  console.log('[VoiceService] Toolkit URL:', TOOLKIT_URL, '| Key prefix:', TOOLKIT_KEY.substring(0, 8) + '...');
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${TOOLKIT_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      text,
-      model_id: 'eleven_flash_v2_5',
-      voice_settings: {
-        ...voiceSettings,
-        use_speaker_boost: true,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => 'Unknown error');
-    console.log('[VoiceService] TTS API error — status:', response.status, '| body:', errText.substring(0, 300));
-    throw new Error(`TTS failed (${response.status}): ${errText}`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  if (arrayBuffer.byteLength === 0) {
-    console.log('[VoiceService] TTS returned empty audio buffer');
-    throw new Error('TTS returned empty audio');
-  }
-  console.log('[VoiceService] TTS audio buffer size:', arrayBuffer.byteLength, 'bytes');
-  // Cross-platform base64 encoding — btoa() is web-only and crashes on native
+function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
   const bytes = new Uint8Array(arrayBuffer);
+  const blockSize = 0x8000;
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
+
+  for (let i = 0; i < bytes.length; i += blockSize) {
+    const block = bytes.subarray(i, Math.min(i + blockSize, bytes.length));
+    binary += String.fromCharCode(...Array.from(block));
   }
-  const base64 = globalThis.btoa?.(binary) ?? (() => {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-    let result = '', i = 0;
-    for (; i < binary.length; i += 3) {
-      const a = binary.charCodeAt(i);
-      const b = i + 1 < binary.length ? binary.charCodeAt(i + 1) : 0;
-      const c = i + 2 < binary.length ? binary.charCodeAt(i + 2) : 0;
-      result += chars[a >> 2];
-      result += chars[((a & 3) << 4) | (b >> 4)];
-      result += i + 1 < binary.length ? chars[((b & 15) << 2) | (c >> 6)] : '=';
-      result += i + 2 < binary.length ? chars[c & 63] : '=';
-    }
-    return result;
-  })();
-  return `data:audio/mp3;base64,${base64}`;
+
+  if (globalThis.btoa) return globalThis.btoa(binary);
+
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  let result = '';
+  for (let i = 0; i < binary.length; i += 3) {
+    const a = binary.charCodeAt(i);
+    const b = i + 1 < binary.length ? binary.charCodeAt(i + 1) : 0;
+    const c = i + 2 < binary.length ? binary.charCodeAt(i + 2) : 0;
+    result += chars[a >> 2];
+    result += chars[((a & 3) << 4) | (b >> 4)];
+    result += i + 1 < binary.length ? chars[((b & 15) << 2) | (c >> 6)] : '=';
+    result += i + 2 < binary.length ? chars[c & 63] : '=';
+  }
+  return result;
 }
 
-// ---------------------------------------------------------------------------
-// Audio Playback with Barge-in
-// ---------------------------------------------------------------------------
+async function synthesizeChunk(
+  text: string,
+  voiceId: string = VOICE_ID_SOL,
+  speed?: VoiceSpeed,
+  generation: number = speechGeneration,
+): Promise<string> {
+  if (generation !== speechGeneration) throw new Error('barged-in');
 
-/**
- * Play a single TTS chunk. Returns a promise that resolves when playback finishes
- * OR rejects with 'barged-in' if interrupted.
- */
-async function playChunk(audioUri: string): Promise<void> {
-  if (isBargedIn) {
-    throw new Error('barged-in');
+  if (!TOOLKIT_KEY) {
+    throw new Error('Voice toolkit key is not configured');
   }
 
-  // Unload previous sound
+  const url = `${TOOLKIT_URL}/v2/elevenlabs/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`;
+  const voiceSettings = getVoiceSettingsFromSpeed(speed ?? 'normal');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${TOOLKIT_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_flash_v2_5',
+        voice_settings: {
+          ...voiceSettings,
+          use_speaker_boost: true,
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    if (generation !== speechGeneration) throw new Error('barged-in');
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => 'Unknown error');
+      throw new Error(`TTS failed (${response.status}): ${errText.substring(0, 300)}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    if (generation !== speechGeneration) throw new Error('barged-in');
+    if (arrayBuffer.byteLength === 0) throw new Error('TTS returned empty audio');
+
+    return `data:audio/mp3;base64,${arrayBufferToBase64(arrayBuffer)}`;
+  } catch (err) {
+    if (generation !== speechGeneration) throw new Error('barged-in');
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('TTS timeout');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function playChunk(audioUri: string, generation: number): Promise<void> {
+  if (generation !== speechGeneration) throw new Error('barged-in');
+
   if (currentSound) {
     try {
       await currentSound.stopAsync();
       await currentSound.unloadAsync();
-    } catch {
-      // ignore
-    }
+    } catch {}
     currentSound = null;
   }
 
-  // Configure for playback
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: false,
     playsInSilentModeIOS: true,
@@ -163,6 +167,8 @@ async function playChunk(audioUri: string): Promise<void> {
     playThroughEarpieceAndroid: false,
   });
 
+  if (generation !== speechGeneration) throw new Error('barged-in');
+
   const { sound } = await Audio.Sound.createAsync(
     { uri: audioUri },
     { shouldPlay: true, volume: 1.0 },
@@ -170,42 +176,36 @@ async function playChunk(audioUri: string): Promise<void> {
   currentSound = sound;
 
   return new Promise<void>((resolve, reject) => {
-    let resolved = false;
+    let settled = false;
+    const settle = (kind: 'resolve' | 'reject') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(safetyTimer);
+      sound.setOnPlaybackStatusUpdate(null);
+      sound.unloadAsync().catch(() => {});
+      if (currentSound === sound) currentSound = null;
+      if (kind === 'reject') reject(new Error('barged-in'));
+      else resolve();
+    };
+
+    const safetyTimer = setTimeout(() => settle('resolve'), 30000);
 
     sound.setOnPlaybackStatusUpdate((status) => {
       if (!status.isLoaded) return;
-      if (isBargedIn && !resolved) {
-        resolved = true;
+      if (generation !== speechGeneration) {
         sound.stopAsync().catch(() => {});
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        reject(new Error('barged-in'));
+        settle('reject');
         return;
       }
-      if (status.didJustFinish && !resolved) {
-        resolved = true;
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        resolve();
-      }
+      if (status.didJustFinish) settle('resolve');
     });
-
-    // Safety timeout: 30 seconds per chunk
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        resolve();
-      }
-    }, 30000);
   });
 }
 
 /**
- * Stream-speak text — chunks it into sentences, synthesizes and plays each sequentially.
- * Calls onChunk callback for each sentence being spoken (for transcript sync).
- * Returns 'completed' or 'interrupted'.
+ * Chunked speech with cancellation and one-chunk-ahead synthesis. The next
+ * sentence is synthesized while the current sentence is playing, reducing the
+ * dead air between sentences without changing the existing provider.
  */
 export async function speakStreaming(
   text: string,
@@ -215,55 +215,62 @@ export async function speakStreaming(
 ): Promise<'completed' | 'interrupted'> {
   if (!text.trim()) return 'completed';
 
-  isBargedIn = false;
+  const generation = speechGeneration;
   const chunks = chunkForStreamingTTS(text);
+  let nextAudioPromise: Promise<string> | null = synthesizeChunk(
+    chunks[0],
+    voiceId,
+    speed,
+    generation,
+  );
 
   for (let i = 0; i < chunks.length; i++) {
-    if (isBargedIn) {
-      return 'interrupted';
-    }
+    if (generation !== speechGeneration) return 'interrupted';
 
     const chunk = chunks[i];
     onChunk?.(i, chunk, chunks.length);
 
     try {
-      const audioUri = await synthesizeChunk(chunk, voiceId, speed);
-      console.log('[VoiceService] Chunk ' + (i + 1) + '/' + chunks.length + ' synthesized, URI length:', audioUri.length);
-      if (isBargedIn) return 'interrupted';
-      await playChunk(audioUri);
-      console.log('[VoiceService] Chunk ' + (i + 1) + '/' + chunks.length + ' played successfully');
+      const audioUri = await nextAudioPromise!;
+      if (generation !== speechGeneration) return 'interrupted';
+
+      nextAudioPromise = i + 1 < chunks.length
+        ? synthesizeChunk(chunks[i + 1], voiceId, speed, generation)
+        : null;
+
+      await playChunk(audioUri, generation);
     } catch (err) {
-      if (err instanceof Error && err.message === 'barged-in') {
-        console.log('[VoiceService] Barge-in detected during chunk ' + (i + 1));
+      if (
+        generation !== speechGeneration ||
+        (err instanceof Error && err.message === 'barged-in')
+      ) {
         return 'interrupted';
       }
-      console.log('[VoiceService] Chunk ' + (i + 1) + '/' + chunks.length + ' FAILED:', String(err).substring(0, 200));
-      // Continue to next chunk on non-barge errors—don't block the whole response
+
+      console.log('[VoiceService] Speech chunk failed:', String(err).substring(0, 200));
+
+      // If prefetch failed, rebuild the next promise for the next iteration.
+      if (i + 1 < chunks.length && !nextAudioPromise) {
+        nextAudioPromise = synthesizeChunk(chunks[i + 1], voiceId, speed, generation);
+      }
     }
   }
 
-  return 'completed';
+  return generation === speechGeneration ? 'completed' : 'interrupted';
 }
 
-/**
- * Stop any currently playing speech immediately (barge-in).
- */
 export async function stopSpeech(): Promise<void> {
-  isBargedIn = true;
+  speechGeneration += 1;
   if (currentSound) {
-    try {
-      await currentSound.stopAsync();
-      await currentSound.unloadAsync();
-    } catch {
-      // ignore
-    }
+    const sound = currentSound;
     currentSound = null;
+    try {
+      await sound.stopAsync();
+      await sound.unloadAsync();
+    } catch {}
   }
 }
 
-/**
- * Simple speak for non-streaming use cases (backward compat).
- */
 export async function speak(text: string, voiceId?: string): Promise<void> {
   await speakStreaming(text, undefined, voiceId);
 }
@@ -273,53 +280,32 @@ export async function speak(text: string, voiceId?: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export interface AudioLevels {
-  /** RMS power in dBFS (-160 to 0). Higher = louder. */
   metering: number;
-  /** Whether current levels indicate speech (above threshold). */
   isSpeaking: boolean;
-  /** Normalized level 0-1 for UI animations. */
   normalizedLevel: number;
 }
 
-// Default silence threshold: -40 dBFS is a common threshold for speech
 const SILENCE_THRESHOLD_DB = -40;
-// How long silence must persist to be considered "done speaking" (ms)
 const SILENCE_DURATION_MS = 1500;
-// Minimum speaking duration before we allow silence detection (ms) — prevents false triggers
 const MIN_SPEAKING_DURATION_MS = 800;
 
-/**
- * Start audio metering on the active recording. Returns a cleanup function.
- * Calls the callback with audio level data at ~100ms intervals.
- */
 export function startAudioMetering(
   recording: Audio.Recording,
   onLevels: (levels: AudioLevels) => void,
   intervalMs: number = 100,
 ): () => void {
-  // Enable metering on the recording
   recording.setProgressUpdateInterval(intervalMs);
   recording.setOnRecordingStatusUpdate((status) => {
     if (!status.isRecording) return;
-    // metering is in dBFS, range -160 to 0
     const metering = status.metering ?? -160;
     const isSpeaking = metering > SILENCE_THRESHOLD_DB;
-    // Normalize: -60 dBFS → 0, 0 dBFS → 1
     const normalizedLevel = Math.max(0, Math.min(1, (metering + 60) / 60));
-
     onLevels({ metering, isSpeaking, normalizedLevel });
   });
 
-  // Return cleanup
-  return () => {
-    recording.setOnRecordingStatusUpdate(null);
-  };
+  return () => recording.setOnRecordingStatusUpdate(null);
 }
 
-/**
- * Create a silence detector that triggers after sustained silence.
- * Returns { start, stop, reset } controls.
- */
 export function createSilenceDetector(
   onSilenceDetected: () => void,
   options?: {
@@ -340,7 +326,10 @@ export function createSilenceDetector(
   let isRunning = false;
 
   function updateLevels(levels: AudioLevels) {
-    lastLevels = levels;
+    lastLevels = {
+      ...levels,
+      isSpeaking: levels.metering > silenceThreshold,
+    };
   }
 
   function start(initialLevels?: AudioLevels) {
@@ -349,38 +338,29 @@ export function createSilenceDetector(
     hasTriggered = false;
     speakingStartTime = null;
     silenceStartTime = null;
-    if (initialLevels) lastLevels = initialLevels;
+    if (initialLevels) updateLevels(initialLevels);
 
     checkInterval = setInterval(() => {
       if (!isRunning || !lastLevels) return;
 
       const now = Date.now();
-
       if (lastLevels.isSpeaking) {
-        // Currently speaking
-        if (speakingStartTime === null) {
-          speakingStartTime = now;
-        }
-        silenceStartTime = null; // Reset silence counter
-      } else {
-        // Currently silent
-        if (
-          speakingStartTime !== null &&
-          (now - speakingStartTime) >= minSpeakingDuration
-        ) {
-          // Was speaking long enough, now track silence
-          if (silenceStartTime === null) {
-            silenceStartTime = now;
-          }
+        if (speakingStartTime === null) speakingStartTime = now;
+        silenceStartTime = null;
+        return;
+      }
 
-          if (
-            !hasTriggered &&
-            silenceStartTime !== null &&
-            (now - silenceStartTime) >= silenceDuration
-          ) {
-            hasTriggered = true;
-            onSilenceDetected();
-          }
+      if (
+        speakingStartTime !== null &&
+        now - speakingStartTime >= minSpeakingDuration
+      ) {
+        if (silenceStartTime === null) silenceStartTime = now;
+        if (
+          !hasTriggered &&
+          now - silenceStartTime >= silenceDuration
+        ) {
+          hasTriggered = true;
+          onSilenceDetected();
         }
       }
     }, 100);
@@ -406,17 +386,8 @@ export function createSilenceDetector(
   return { start, stop, reset, updateLevels };
 }
 
-// ---------------------------------------------------------------------------
-// Barge-in Detection during TTS Playback
-// ---------------------------------------------------------------------------
-
-/**
- * Check if the given audio levels indicate the user is trying to interrupt.
- * Returns true if the coach is speaking loudly enough to barge in.
- */
 export function shouldBargeIn(levels: AudioLevels): boolean {
-  // More aggressive threshold for barge-in — coach needs to speak clearly
-  const BARGE_IN_THRESHOLD = -32; // dBFS — louder than normal silence threshold
+  const BARGE_IN_THRESHOLD = -32;
   return levels.metering > BARGE_IN_THRESHOLD && levels.isSpeaking;
 }
 
@@ -424,18 +395,52 @@ export function shouldBargeIn(levels: AudioLevels): boolean {
 // Athlete Context Detection
 // ---------------------------------------------------------------------------
 
+function normalizeSpeechText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
- * Detect which athlete(s) are mentioned in a transcript.
- * Returns array of matched student IDs.
+ * Match full names first. If no full-name match exists for a student, also
+ * accept a first name only when that first name is unique in the roster. This
+ * handles accents and natural speech while avoiding ambiguous first-name hits.
  */
 export function detectAthleteContext(
   transcript: string,
   students: Array<{ id: string; name: string }>,
 ): string[] {
-  const lowerText = transcript.toLowerCase();
-  return students
-    .filter((s) => lowerText.includes(s.name.toLowerCase()))
-    .map((s) => s.id);
+  const normalizedTranscript = ` ${normalizeSpeechText(transcript)} `;
+  if (!normalizedTranscript.trim() || students.length === 0) return [];
+
+  const normalizedStudents = students.map((student) => {
+    const fullName = normalizeSpeechText(student.name);
+    const firstName = fullName.split(' ')[0] || '';
+    return { ...student, fullName, firstName };
+  });
+
+  const firstNameCounts = new Map<string, number>();
+  for (const student of normalizedStudents) {
+    if (!student.firstName) continue;
+    firstNameCounts.set(student.firstName, (firstNameCounts.get(student.firstName) ?? 0) + 1);
+  }
+
+  return normalizedStudents
+    .filter((student) => {
+      if (!student.fullName) return false;
+      if (normalizedTranscript.includes(` ${student.fullName} `)) return true;
+
+      return (
+        student.firstName.length >= 3 &&
+        firstNameCounts.get(student.firstName) === 1 &&
+        normalizedTranscript.includes(` ${student.firstName} `)
+      );
+    })
+    .map((student) => student.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,18 +452,12 @@ export interface RecordingSetup {
   meteringCleanup: () => void;
 }
 
-/**
- * Set up a recording with metering enabled for continuous conversation.
- */
 export async function setupContinuousRecording(): Promise<RecordingSetup> {
-  console.log('[VoiceService] Requesting microphone permission...');
   const permission = await Audio.requestPermissionsAsync();
-  console.log('[VoiceService] Permission status:', permission.status);
   if (permission.status !== 'granted') {
     throw new Error('Microphone permission denied');
   }
 
-  console.log('[VoiceService] Setting audio mode for recording...');
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: true,
     playsInSilentModeIOS: true,
@@ -467,7 +466,6 @@ export async function setupContinuousRecording(): Promise<RecordingSetup> {
     playThroughEarpieceAndroid: false,
   });
 
-  console.log('[VoiceService] Creating recording instance...');
   const recording = new Audio.Recording();
   await recording.prepareToRecordAsync({
     android: {
@@ -492,55 +490,37 @@ export async function setupContinuousRecording(): Promise<RecordingSetup> {
     web: {},
   });
 
-  console.log('[VoiceService] Starting recording...');
   await recording.startAsync();
-  console.log('[VoiceService] Recording started successfully');
-
   return { recording, meteringCleanup: () => {} };
 }
 
-/**
- * Stop recording, get the file URI, and transcribe the audio.
- * Handles native (iOS/Android) and web differently: native fetch/FormData
- * accepts a { uri, name, type } reference, but web needs a real Blob.
- */
 export async function stopAndGetTranscript(
   recording: Audio.Recording,
   sttUrl: string,
 ): Promise<string | null> {
   try {
     await recording.stopAndUnloadAsync();
-    console.log('[VoiceService] Recording stopped for transcription');
-  } catch (e) {
-    console.log('[VoiceService] Recording already stopped:', String(e).substring(0, 100));
-  }
+  } catch {}
 
   const uri = recording.getURI();
-  if (!uri) {
-    console.log('[VoiceService] No recording URI — cannot transcribe');
-    return null;
-  }
-  console.log('[VoiceService] Recording URI:', uri, '| Platform:', Platform.OS);
+  if (!uri) return null;
 
   const uriParts = uri.split('.');
   const fileType = uriParts[uriParts.length - 1]?.split('?')[0] || (Platform.OS === 'web' ? 'webm' : 'm4a');
   const mimeType = fileType === 'wav' ? 'audio/wav' : `audio/${fileType}`;
-
   const formData = new FormData();
 
   if (Platform.OS === 'web') {
-    // Web: the URI is a blob: URL — fetch it into a real Blob/File before upload.
     try {
       const blobResponse = await fetch(uri);
       const blob = await blobResponse.blob();
       const file = new File([blob], `voice.${fileType}`, { type: blob.type || mimeType });
       formData.append('audio', file);
-    } catch (e) {
-      console.log('[VoiceService] Web blob conversion failed:', String(e).substring(0, 200));
+    } catch (err) {
+      console.log('[VoiceService] Web audio conversion failed:', String(err).substring(0, 160));
       return null;
     }
   } else {
-    // Native (iOS/Android): pass the file reference directly.
     formData.append('audio', {
       uri,
       name: `voice.${fileType}`,
@@ -550,31 +530,42 @@ export async function stopAndGetTranscript(
 
   formData.append('language', 'es');
 
-  console.log('[VoiceService] Sending STT request to:', sttUrl);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), STT_TIMEOUT_MS);
+
   try {
-    const response = await fetch(sttUrl, { method: 'POST', body: formData });
-    console.log('[VoiceService] STT response status:', response.status);
+    const response = await fetch(sttUrl, {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal,
+    });
+
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
-      console.log('[VoiceService] STT error body:', errText.substring(0, 200));
+      console.log('[VoiceService] STT failed:', response.status, errText.substring(0, 160));
       return null;
     }
+
     const data = await response.json();
-    console.log('[VoiceService] STT result:', JSON.stringify(data).substring(0, 200));
-    return data.text?.trim() || null;
-  } catch (e) {
-    console.log('[VoiceService] STT network error:', String(e).substring(0, 200));
+    return typeof data.text === 'string' ? data.text.trim() || null : null;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      console.log('[VoiceService] STT timeout');
+    } else {
+      console.log('[VoiceService] STT network error:', String(err).substring(0, 160));
+    }
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 
 export function cleanupVoiceService(): void {
-  isBargedIn = true;
+  speechGeneration += 1;
   if (currentSound) {
     currentSound.unloadAsync().catch(() => {});
     currentSound = null;
