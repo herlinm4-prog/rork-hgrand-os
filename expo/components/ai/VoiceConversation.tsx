@@ -1,582 +1,738 @@
-// utils/voiceService.ts — HGRAND Neural Voice Engine
-// Streaming TTS, silence detection, barge-in support, audio metering.
-// ElevenLabs Flash v2.5 via Rork proxy for sub-400ms first-chunk latency.
+// components/ai/VoiceConversation.tsx
+// Premium Apple-style voice conversation — deep indigo-black backdrop,
+// frosted glass top bar, refined orb centerpiece, elegant typography.
+//
+// Design philosophy: Apple's voice memo meets a luxury audio experience.
+// Every element is intentional — generous whitespace, subtle borders,
+// refined colors that breathe with the conversation.
 
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Modal,
+  Animated,
+  Easing,
+  Platform,
+} from 'react-native';
+import { StatusBar } from 'expo-status-bar';
 import { Audio } from 'expo-av';
-import { Platform } from 'react-native';
+import { X, User, Settings } from 'lucide-react-native';
+import * as Haptics from 'expo-haptics';
+import {
+  speakStreaming,
+  stopSpeech,
+  detectAthleteContext,
+  cleanupVoiceService,
+  createSilenceDetector,
+  shouldBargeIn,
+  setupContinuousRecording,
+  stopAndGetTranscript,
+  getVoiceIdFromPreset,
+  type AudioLevels,
+} from '@/utils/voiceService';
+import { recordMemoryEvent, saveConversationTranscript } from '@/utils/api';
+import { VoiceOrb } from './VoiceOrb';
+import { VoiceTranscript } from './VoiceTranscript';
+import type { VoiceSettings, VoiceSpeed } from '@/types/settings';
 
-import { VOICE_PRESETS, VOICE_SPEED_SETTINGS, type VoiceSpeed } from '@/types/settings';
+// ── Types ──────────────────────────────────────────────────────────────
 
-const TOOLKIT_URL = process.env.EXPO_PUBLIC_TOOLKIT_URL || 'https://toolkit.rork.com';
-const TOOLKIT_KEY = process.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY || '';
+export type VoicePhase =
+  | 'idle'
+  | 'listening'
+  | 'thinking'
+  | 'speaking'
+  | 'interrupted';
 
-// ---------------------------------------------------------------------------
-// Voice IDs
-// ---------------------------------------------------------------------------
-
-/** Sol's voice — warm, intimate, natural Spanish female (Matilda) */
-const VOICE_ID_SOL = 'XrExE9yKIg1WjnnlVkGX';
-
-/** Get voice ID from preset ID */
-export function getVoiceIdFromPreset(presetId: string): string {
-  const preset = VOICE_PRESETS.find((p) => p.id === presetId);
-  return preset?.voiceId ?? VOICE_ID_SOL;
+interface VoiceTurn {
+  role: 'coach' | 'assistant';
+  text: string;
+  timestamp: number;
 }
 
-/** Get ElevenLabs voice settings from speed preference */
-export function getVoiceSettingsFromSpeed(speed: VoiceSpeed) {
-  return VOICE_SPEED_SETTINGS[speed] ?? VOICE_SPEED_SETTINGS.normal;
+interface VoiceConversationProps {
+  visible: boolean;
+  onClose: () => void;
+  systemContext: string;
+  students: Array<{ id: string; name: string }>;
+  onCoachMessage: (text: string, onPartial?: (chunkText: string) => void) => Promise<string>;
+  voiceSettings: VoiceSettings;
+  onOpenSettings: () => void;
 }
 
-// ---------------------------------------------------------------------------
-// TTS — streaming sentence-by-sentence via ElevenLabs Flash v2.5
-// ---------------------------------------------------------------------------
+const STT_URL = 'https://toolkit.rork.com/stt/transcribe/';
 
-let currentSound: Audio.Sound | null = null;
-let isBargedIn = false;
+// ── Premium Apple dark palette ────────────────────────────────────────
 
-/**
- * Split text into natural sentence-like chunks for streaming TTS.
- * Splits on sentence boundaries, keeping chunks under ~200 chars for low latency.
- */
-export function chunkForStreamingTTS(text: string): string[] {
-  const chunks: string[] = [];
-  // Split on sentence endings: . ! ? \n  and also on ; — like natural pauses
-  const rawChunks = text.split(/(?<=[.!?\n;])\s+/);
+const BG = '#08080D';
+const SURFACE = 'rgba(255,255,255,0.03)';
+const SURFACE_RAISED = 'rgba(255,255,255,0.05)';
+const BORDER = 'rgba(255,255,255,0.06)';
+const BORDER_ACTIVE = 'rgba(255,255,255,0.1)';
+const TEXT_PRIMARY = 'rgba(255,255,255,0.92)';
+const TEXT_SECONDARY = 'rgba(255,255,255,0.55)';
+const TEXT_TERTIARY = 'rgba(255,255,255,0.28)';
+const TEXT_QUATERNARY = 'rgba(255,255,255,0.1)';
+const ACCENT = '#818CF8';
+const SUCCESS = '#34C759';
+const DANGER = 'rgba(252,165,165,0.9)';
+const DANGER_BG = 'rgba(239,68,68,0.08)';
+const DANGER_BORDER = 'rgba(239,68,68,0.15)';
 
-  let buffer = '';
-  for (const chunk of rawChunks) {
-    const trimmed = chunk.trim();
-    if (!trimmed) continue;
+// ── Component ──────────────────────────────────────────────────────────
 
-    if (buffer.length + trimmed.length > 200 && buffer.length > 0) {
-      chunks.push(buffer.trim());
-      buffer = trimmed;
-    } else {
-      buffer += (buffer ? ' ' : '') + trimmed;
+export function VoiceConversation({
+  visible,
+  onClose,
+  systemContext,
+  students,
+  onCoachMessage,
+  voiceSettings,
+  onOpenSettings,
+}: VoiceConversationProps) {
+  // ── State ────────────────────────────────────────────────────────
+  const [phase, setPhase] = useState<VoicePhase>('idle');
+  const [turns, setTurns] = useState<VoiceTurn[]>([]);
+  const [streamingText, setStreamingText] = useState<string>('');
+  const [isStreamingAI, setIsStreamingAI] = useState<boolean>(false);
+  const [detectedAthletes, setDetectedAthletes] = useState<Array<{ id: string; name: string }>>([]);
+  const [micLevel, setMicLevel] = useState<number>(0);
+  const [conversationStarted, setConversationStarted] = useState<boolean>(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [pipelineStep, setPipelineStep] = useState<string>('');
+
+  // ── Refs ─────────────────────────────────────────────────────────
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const isMountedRef = useRef(true);
+  const phaseRef = useRef<VoicePhase>('idle');
+  const silenceDetectorRef = useRef<ReturnType<typeof createSilenceDetector> | null>(null);
+  const bargeMonitorRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isRecordingRef = useRef(false);
+  const processVoiceInputRef = useRef<() => Promise<void>>(async () => {});
+  const studentsRef = useRef(students);
+  studentsRef.current = students;
+  const voiceSettingsRef = useRef(voiceSettings);
+  voiceSettingsRef.current = voiceSettings;
+
+  // ── Progressive speech queue ────────────────────────────────────────
+  // Sentences arrive from onCoachMessage as soon as they're generated
+  // (not after the whole reply is done) and are spoken in order here —
+  // this is what gives Sol a fluid, "thinking out loud" feel instead of
+  // a long silent pause followed by one big block of speech.
+  const speechQueueRef = useRef<string[]>([]);
+  const speechQueueActiveRef = useRef(false);
+  const speechDoneRef = useRef(false);
+
+  // Fade-in animation for the entire modal
+  const fadeIn = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      cleanupVoiceService();
+      stopAllInternal();
+    };
+  }, []);
+
+  // Fade-in on visible
+  useEffect(() => {
+    if (visible) {
+      fadeIn.setValue(0);
+      Animated.timing(fadeIn, {
+        toValue: 1,
+        duration: 320,
+        easing: Easing.out(Easing.ease),
+        useNativeDriver: true,
+      }).start();
     }
-  }
-  if (buffer.trim()) {
-    chunks.push(buffer.trim());
-  }
+  }, [visible, fadeIn]);
 
-  // If still empty, return the whole text as one chunk
-  if (chunks.length === 0 && text.trim()) {
-    return [text.trim()];
-  }
-
-  return chunks;
-}
-
-/**
- * Synthesize a single chunk of text to speech.
- * Returns a base64 data URI to the MP3 audio.
- */
-async function synthesizeChunk(text: string, voiceId: string = VOICE_ID_SOL, speed?: VoiceSpeed): Promise<string> {
-  const url = `${TOOLKIT_URL}/v2/elevenlabs/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`;
-  const voiceSettings = getVoiceSettingsFromSpeed(speed ?? 'normal');
-
-  console.log('[VoiceService] Synthesizing chunk:', text.substring(0, 80), '| voice:', voiceId);
-  console.log('[VoiceService] Toolkit URL:', TOOLKIT_URL, '| Key prefix:', TOOLKIT_KEY.substring(0, 8) + '...');
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${TOOLKIT_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      text,
-      model_id: 'eleven_flash_v2_5',
-      voice_settings: {
-        ...voiceSettings,
-        use_speaker_boost: true,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => 'Unknown error');
-    console.log('[VoiceService] TTS API error — status:', response.status, '| body:', errText.substring(0, 300));
-    throw new Error(`TTS failed (${response.status}): ${errText}`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  if (arrayBuffer.byteLength === 0) {
-    console.log('[VoiceService] TTS returned empty audio buffer');
-    throw new Error('TTS returned empty audio');
-  }
-  console.log('[VoiceService] TTS audio buffer size:', arrayBuffer.byteLength, 'bytes');
-  // Cross-platform base64 encoding — btoa() is web-only and crashes on native
-  const bytes = new Uint8Array(arrayBuffer);
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  const base64 = globalThis.btoa?.(binary) ?? (() => {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-    let result = '', i = 0;
-    for (; i < binary.length; i += 3) {
-      const a = binary.charCodeAt(i);
-      const b = i + 1 < binary.length ? binary.charCodeAt(i + 1) : 0;
-      const c = i + 2 < binary.length ? binary.charCodeAt(i + 2) : 0;
-      result += chars[a >> 2];
-      result += chars[((a & 3) << 4) | (b >> 4)];
-      result += i + 1 < binary.length ? chars[((b & 15) << 2) | (c >> 6)] : '=';
-      result += i + 2 < binary.length ? chars[c & 63] : '=';
+  const stopAllInternal = useCallback(async () => {
+    silenceDetectorRef.current?.stop();
+    silenceDetectorRef.current = null;
+    if (bargeMonitorRef.current) {
+      clearInterval(bargeMonitorRef.current);
+      bargeMonitorRef.current = null;
     }
-    return result;
-  })();
-  return `data:audio/mp3;base64,${base64}`;
-}
+    if (recordingRef.current) {
+      try { await recordingRef.current.stopAndUnloadAsync(); } catch {}
+      recordingRef.current = null;
+    }
+    isRecordingRef.current = false;
+  }, []);
 
-// ---------------------------------------------------------------------------
-// Audio Playback with Barge-in
-// ---------------------------------------------------------------------------
+  // ── Silence detection ────────────────────────────────────────────
+  const handleSilenceDetected = useCallback(() => {
+    if (phaseRef.current === 'listening') {
+      processVoiceInputRef.current();
+    }
+  }, []);
 
-/**
- * Play a single TTS chunk. Returns a promise that resolves when playback finishes
- * OR rejects with 'barged-in' if interrupted.
- */
-async function playChunk(audioUri: string): Promise<void> {
-  if (isBargedIn) {
-    throw new Error('barged-in');
-  }
+  // ── Barge-in monitoring ──────────────────────────────────────────
+  const startBargeMonitoring = useCallback(() => {
+    if (bargeMonitorRef.current) clearInterval(bargeMonitorRef.current);
+    bargeMonitorRef.current = setInterval(async () => {
+      if (!recordingRef.current || !isRecordingRef.current) return;
+      try {
+        const status = await recordingRef.current.getStatusAsync();
+        if (!status.isRecording) return;
+        const metering = (status as any).metering ?? -160;
+        const levels: AudioLevels = {
+          metering,
+          isSpeaking: metering > -32,
+          normalizedLevel: Math.max(0, Math.min(1, (metering + 60) / 60)),
+        };
+        if (shouldBargeIn(levels) && phaseRef.current === 'speaking') {
+          if (bargeMonitorRef.current) clearInterval(bargeMonitorRef.current);
+          bargeMonitorRef.current = null;
+          await stopSpeech();
+          if (isMountedRef.current) {
+            setPhase('interrupted');
+            setStreamingText('');
+            setIsStreamingAI(false);
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+            setTimeout(() => {
+              if (isMountedRef.current && phaseRef.current === 'interrupted') {
+                startListening();
+              }
+            }, 400);
+          }
+        }
+      } catch {}
+    }, 200);
+  }, []);
 
-  // Unload previous sound
-  if (currentSound) {
+  const stopBargeMonitoring = useCallback(() => {
+    if (bargeMonitorRef.current) {
+      clearInterval(bargeMonitorRef.current);
+      bargeMonitorRef.current = null;
+    }
+  }, []);
+
+  // ── Progressive speech queue runner ──────────────────────────────
+  // Pulls sentences off the queue one at a time and speaks them in
+  // order, as soon as they're available — while the AI may still be
+  // generating the rest of the reply in the background.
+  const runSpeechQueue = useCallback(async () => {
+    if (speechQueueActiveRef.current) return;
+    speechQueueActiveRef.current = true;
     try {
-      await currentSound.stopAsync();
-      await currentSound.unloadAsync();
-    } catch {
-      // ignore
+      while (true) {
+        if (!isMountedRef.current) break;
+        if (speechQueueRef.current.length === 0) {
+          if (speechDoneRef.current) break;
+          await new Promise((r) => setTimeout(r, 60));
+          continue;
+        }
+        const chunk = speechQueueRef.current.shift()!;
+        const vs = voiceSettingsRef.current;
+        const voiceId = getVoiceIdFromPreset(vs.voicePresetId);
+        const speed = vs.speed as VoiceSpeed;
+        const result = await speakStreaming(chunk, undefined, voiceId, speed);
+        if (result === 'interrupted') {
+          speechQueueRef.current = [];
+          break;
+        }
+      }
+    } finally {
+      speechQueueActiveRef.current = false;
     }
-    currentSound = null;
-  }
+  }, []);
 
-  // Configure for playback
-  await Audio.setAudioModeAsync({
-    allowsRecordingIOS: false,
-    playsInSilentModeIOS: true,
-    staysActiveInBackground: false,
-    shouldDuckAndroid: true,
-    playThroughEarpieceAndroid: false,
-  });
+  // ── End call ─────────────────────────────────────────────────────
+  const handleEndCall = useCallback(async () => {
+    silenceDetectorRef.current?.stop();
+    silenceDetectorRef.current = null;
+    stopBargeMonitoring();
+    await stopSpeech();
+    await stopAllInternal();
+    cleanupVoiceService();
+    onClose();
+  }, [onClose, stopAllInternal, stopBargeMonitoring]);
 
-  const { sound } = await Audio.Sound.createAsync(
-    { uri: audioUri },
-    { shouldPlay: true, volume: 1.0 },
-  );
-  currentSound = sound;
-
-  return new Promise<void>((resolve, reject) => {
-    let resolved = false;
-
-    sound.setOnPlaybackStatusUpdate((status) => {
-      if (!status.isLoaded) return;
-      if (isBargedIn && !resolved) {
-        resolved = true;
-        sound.stopAsync().catch(() => {});
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        reject(new Error('barged-in'));
-        return;
-      }
-      if (status.didJustFinish && !resolved) {
-        resolved = true;
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        resolve();
-      }
-    });
-
-    // Safety timeout: 30 seconds per chunk
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        resolve();
-      }
-    }, 30000);
-  });
-}
-
-/**
- * Stream-speak text — chunks it into sentences, synthesizes and plays each sequentially.
- * Calls onChunk callback for each sentence being spoken (for transcript sync).
- * Returns 'completed' or 'interrupted'.
- */
-export async function speakStreaming(
-  text: string,
-  onChunk?: (chunkIndex: number, chunkText: string, totalChunks: number) => void,
-  voiceId: string = VOICE_ID_SOL,
-  speed?: VoiceSpeed,
-): Promise<'completed' | 'interrupted'> {
-  if (!text.trim()) return 'completed';
-
-  isBargedIn = false;
-  const chunks = chunkForStreamingTTS(text);
-
-  for (let i = 0; i < chunks.length; i++) {
-    if (isBargedIn) {
-      return 'interrupted';
-    }
-
-    const chunk = chunks[i];
-    onChunk?.(i, chunk, chunks.length);
-
+  // ── Start listening ──────────────────────────────────────────────
+  const startListening = useCallback(async () => {
     try {
-      const audioUri = await synthesizeChunk(chunk, voiceId, speed);
-      console.log('[VoiceService] Chunk ' + (i + 1) + '/' + chunks.length + ' synthesized, URI length:', audioUri.length);
-      if (isBargedIn) return 'interrupted';
-      await playChunk(audioUri);
-      console.log('[VoiceService] Chunk ' + (i + 1) + '/' + chunks.length + ' played successfully');
+      setErrorMsg(null);
+      setPipelineStep('Configurando micrófono...');
+      await stopAllInternal();
+      const { recording } = await setupContinuousRecording();
+      recordingRef.current = recording;
+      isRecordingRef.current = true;
+
+      const detector = createSilenceDetector(handleSilenceDetected, {
+        silenceThreshold: -38,
+        silenceDuration: 1500,
+        minSpeakingDuration: 800,
+      });
+      silenceDetectorRef.current = detector;
+
+      let meteringActive = true;
+      recording.setProgressUpdateInterval(100);
+      recording.setOnRecordingStatusUpdate((status) => {
+        if (!status.isRecording || !meteringActive) return;
+        const metering = (status as any).metering ?? -160;
+        const isSpeaking = metering > -38;
+        const normalizedLevel = Math.max(0, Math.min(1, (metering + 60) / 60));
+        setMicLevel(normalizedLevel);
+        detector.updateLevels({ metering, isSpeaking, normalizedLevel });
+      });
+
+      detector.start();
+      setPhase('listening');
+      setStreamingText('');
+      setIsStreamingAI(false);
+      setConversationStarted(true);
+      setPipelineStep('');
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     } catch (err) {
-      if (err instanceof Error && err.message === 'barged-in') {
-        console.log('[VoiceService] Barge-in detected during chunk ' + (i + 1));
-        return 'interrupted';
-      }
-      console.log('[VoiceService] Chunk ' + (i + 1) + '/' + chunks.length + ' FAILED:', String(err).substring(0, 200));
-      // Continue to next chunk on non-barge errors—don't block the whole response
+      console.log('[VoiceConv] Start listening ERROR:', String(err));
+      setErrorMsg('No pude acceder al micrófono. Verifica los permisos.');
+      if (isMountedRef.current) setPhase('idle');
     }
-  }
+  }, [handleSilenceDetected, stopAllInternal]);
 
-  return 'completed';
-}
+  // ── Process voice → STT → AI → TTS ───────────────────────────────
+  const processVoiceInput = useCallback(async () => {
+    const recording = recordingRef.current;
+    if (!recording) return;
 
-/**
- * Stop any currently playing speech immediately (barge-in).
- */
-export async function stopSpeech(): Promise<void> {
-  isBargedIn = true;
-  if (currentSound) {
-    try {
-      await currentSound.stopAsync();
-      await currentSound.unloadAsync();
-    } catch {
-      // ignore
-    }
-    currentSound = null;
-  }
-}
+    silenceDetectorRef.current?.stop();
+    silenceDetectorRef.current = null;
+    setPhase('thinking');
+    setErrorMsg(null);
+    setPipelineStep('Transcribiendo...');
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-/**
- * Simple speak for non-streaming use cases (backward compat).
- */
-export async function speak(text: string, voiceId?: string): Promise<void> {
-  await speakStreaming(text, undefined, voiceId);
-}
-
-// ---------------------------------------------------------------------------
-// Audio Metering & Silence Detection
-// ---------------------------------------------------------------------------
-
-export interface AudioLevels {
-  /** RMS power in dBFS (-160 to 0). Higher = louder. */
-  metering: number;
-  /** Whether current levels indicate speech (above threshold). */
-  isSpeaking: boolean;
-  /** Normalized level 0-1 for UI animations. */
-  normalizedLevel: number;
-}
-
-// Default silence threshold: -40 dBFS is a common threshold for speech
-const SILENCE_THRESHOLD_DB = -40;
-// How long silence must persist to be considered "done speaking" (ms)
-const SILENCE_DURATION_MS = 1500;
-// Minimum speaking duration before we allow silence detection (ms) — prevents false triggers
-const MIN_SPEAKING_DURATION_MS = 800;
-
-/**
- * Start audio metering on the active recording. Returns a cleanup function.
- * Calls the callback with audio level data at ~100ms intervals.
- */
-export function startAudioMetering(
-  recording: Audio.Recording,
-  onLevels: (levels: AudioLevels) => void,
-  intervalMs: number = 100,
-): () => void {
-  // Enable metering on the recording
-  recording.setProgressUpdateInterval(intervalMs);
-  recording.setOnRecordingStatusUpdate((status) => {
-    if (!status.isRecording) return;
-    // metering is in dBFS, range -160 to 0
-    const metering = status.metering ?? -160;
-    const isSpeaking = metering > SILENCE_THRESHOLD_DB;
-    // Normalize: -60 dBFS → 0, 0 dBFS → 1
-    const normalizedLevel = Math.max(0, Math.min(1, (metering + 60) / 60));
-
-    onLevels({ metering, isSpeaking, normalizedLevel });
-  });
-
-  // Return cleanup
-  return () => {
     recording.setOnRecordingStatusUpdate(null);
-  };
-}
+    const transcript = await stopAndGetTranscript(recording, STT_URL);
+    recordingRef.current = null;
+    isRecordingRef.current = false;
 
-/**
- * Create a silence detector that triggers after sustained silence.
- * Returns { start, stop, reset } controls.
- */
-export function createSilenceDetector(
-  onSilenceDetected: () => void,
-  options?: {
-    silenceThreshold?: number;
-    silenceDuration?: number;
-    minSpeakingDuration?: number;
-  },
-) {
-  const silenceThreshold = options?.silenceThreshold ?? SILENCE_THRESHOLD_DB;
-  const silenceDuration = options?.silenceDuration ?? SILENCE_DURATION_MS;
-  const minSpeakingDuration = options?.minSpeakingDuration ?? MIN_SPEAKING_DURATION_MS;
+    if (!transcript || !transcript.trim()) {
+      if (isMountedRef.current) {
+        setErrorMsg('No entendí. Intenta de nuevo.');
+        setPhase('idle');
+        setTimeout(() => {
+          if (isMountedRef.current && phaseRef.current === 'idle') startListening();
+        }, 1200);
+      }
+      return;
+    }
 
-  let speakingStartTime: number | null = null;
-  let silenceStartTime: number | null = null;
-  let checkInterval: ReturnType<typeof setInterval> | null = null;
-  let lastLevels: AudioLevels | null = null;
-  let hasTriggered = false;
-  let isRunning = false;
+    if (!isMountedRef.current) return;
 
-  function updateLevels(levels: AudioLevels) {
-    lastLevels = levels;
-  }
+    // Save coach turn
+    const coachTurn: VoiceTurn = { role: 'coach', text: transcript, timestamp: Date.now() };
+    setTurns((prev) => [...prev, coachTurn]);
+    setErrorMsg(null);
 
-  function start(initialLevels?: AudioLevels) {
-    if (isRunning) return;
-    isRunning = true;
-    hasTriggered = false;
-    speakingStartTime = null;
-    silenceStartTime = null;
-    if (initialLevels) lastLevels = initialLevels;
+    saveConversationTranscript({
+      studentId: null,
+      role: 'coach',
+      text: transcript,
+      date: new Date().toISOString(),
+      metadata: { source: 'voice_conversation' },
+    }).catch(() => {});
 
-    checkInterval = setInterval(() => {
-      if (!isRunning || !lastLevels) return;
+    // Detect athlete context
+    const latestStudents = studentsRef.current;
+    const athleteIds = detectAthleteContext(transcript, latestStudents);
+    const matchedAthletes = latestStudents.filter((s) => athleteIds.includes(s.id));
+    setDetectedAthletes(matchedAthletes);
 
-      const now = Date.now();
+    // Save to athlete memory (non-blocking)
+    if (matchedAthletes.length > 0) {
+      for (const athlete of matchedAthletes) {
+        try {
+          await recordMemoryEvent(athlete.id, {
+            type: 'coach_note',
+            title: 'Conversación de voz',
+            description: transcript.substring(0, 500),
+            date: new Date().toISOString(),
+            createdBy: 'ai',
+            metadata: { source: 'voice_conversation' },
+            studentId: athlete.id,
+          });
+        } catch {}
+      }
+    }
 
-      if (lastLevels.isSpeaking) {
-        // Currently speaking
-        if (speakingStartTime === null) {
-          speakingStartTime = now;
-        }
-        silenceStartTime = null; // Reset silence counter
-      } else {
-        // Currently silent
-        if (
-          speakingStartTime !== null &&
-          (now - speakingStartTime) >= minSpeakingDuration
-        ) {
-          // Was speaking long enough, now track silence
-          if (silenceStartTime === null) {
-            silenceStartTime = now;
-          }
+    // Get AI response — speak each sentence as soon as it's ready instead
+    // of waiting for the full reply, so Sol feels like she's talking in
+    // real time rather than pausing then dumping one long block of audio.
+    setPipelineStep('Sol está pensando...');
+    try {
+      setPhase('speaking');
+      setIsStreamingAI(true);
+      setPipelineStep('Reproduciendo respuesta...');
 
-          if (
-            !hasTriggered &&
-            silenceStartTime !== null &&
-            (now - silenceStartTime) >= silenceDuration
-          ) {
-            hasTriggered = true;
-            onSilenceDetected();
-          }
+      stopBargeMonitoring();
+      await stopAllInternal();
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      speechQueueRef.current = [];
+      speechDoneRef.current = false;
+
+      const handlePartial = (chunkText: string) => {
+        if (!isMountedRef.current) return;
+        setStreamingText((prev) => (prev ? prev + ' ' + chunkText : chunkText));
+        speechQueueRef.current.push(chunkText);
+        void runSpeechQueue();
+      };
+
+      const aiResponse = await onCoachMessage(transcript, handlePartial);
+      speechDoneRef.current = true;
+
+      // Let any queued sentences finish playing before moving on
+      while (isMountedRef.current && (speechQueueActiveRef.current || speechQueueRef.current.length > 0)) {
+        await new Promise((r) => setTimeout(r, 80));
+      }
+
+      if (!isMountedRef.current) return;
+
+      const aiTurn: VoiceTurn = { role: 'assistant', text: aiResponse, timestamp: Date.now() };
+      setTurns((prev) => [...prev, aiTurn]);
+
+      saveConversationTranscript({
+        studentId: matchedAthletes[0]?.id ?? null,
+        role: 'assistant',
+        text: aiResponse,
+        date: new Date().toISOString(),
+        metadata: { source: 'voice_conversation' },
+      }).catch(() => {});
+
+      if (matchedAthletes.length > 0) {
+        for (const athlete of matchedAthletes) {
+          try {
+            await recordMemoryEvent(athlete.id, {
+              type: 'ai_suggestion',
+              title: 'Respuesta de Sol (voz)',
+              description: aiResponse.substring(0, 500),
+              date: new Date().toISOString(),
+              createdBy: 'ai',
+              metadata: { source: 'voice_conversation' },
+              studentId: athlete.id,
+            });
+          } catch {}
         }
       }
-    }, 100);
-  }
 
-  function stop() {
-    isRunning = false;
-    if (checkInterval !== null) {
-      clearInterval(checkInterval);
-      checkInterval = null;
+      setIsStreamingAI(false);
+    } catch (err) {
+      console.log('[VoiceConv] AI/TTS error:', String(err));
+      speechDoneRef.current = true;
+      speechQueueRef.current = [];
+      if (isMountedRef.current) {
+        setErrorMsg('La voz no está disponible, pero puedes leer mi respuesta arriba.');
+      }
     }
-    speakingStartTime = null;
-    silenceStartTime = null;
-    hasTriggered = false;
-  }
 
-  function reset() {
-    hasTriggered = false;
-    speakingStartTime = null;
-    silenceStartTime = null;
-  }
+    if (!isMountedRef.current) return;
 
-  return { start, stop, reset, updateLevels };
-}
+    setPhase('idle');
+    setStreamingText('');
+    setPipelineStep('');
+    await stopAllInternal();
 
-// ---------------------------------------------------------------------------
-// Barge-in Detection during TTS Playback
-// ---------------------------------------------------------------------------
-
-/**
- * Check if the given audio levels indicate the user is trying to interrupt.
- * Returns true if the coach is speaking loudly enough to barge in.
- */
-export function shouldBargeIn(levels: AudioLevels): boolean {
-  // More aggressive threshold for barge-in — coach needs to speak clearly
-  const BARGE_IN_THRESHOLD = -32; // dBFS — louder than normal silence threshold
-  return levels.metering > BARGE_IN_THRESHOLD && levels.isSpeaking;
-}
-
-// ---------------------------------------------------------------------------
-// Athlete Context Detection
-// ---------------------------------------------------------------------------
-
-/**
- * Detect which athlete(s) are mentioned in a transcript.
- * Returns array of matched student IDs.
- */
-export function detectAthleteContext(
-  transcript: string,
-  students: Array<{ id: string; name: string }>,
-): string[] {
-  const lowerText = transcript.toLowerCase();
-  return students
-    .filter((s) => lowerText.includes(s.name.toLowerCase()))
-    .map((s) => s.id);
-}
-
-// ---------------------------------------------------------------------------
-// Audio Recording Setup
-// ---------------------------------------------------------------------------
-
-export interface RecordingSetup {
-  recording: Audio.Recording;
-  meteringCleanup: () => void;
-}
-
-/**
- * Set up a recording with metering enabled for continuous conversation.
- */
-export async function setupContinuousRecording(): Promise<RecordingSetup> {
-  console.log('[VoiceService] Requesting microphone permission...');
-  const permission = await Audio.requestPermissionsAsync();
-  console.log('[VoiceService] Permission status:', permission.status);
-  if (permission.status !== 'granted') {
-    throw new Error('Microphone permission denied');
-  }
-
-  console.log('[VoiceService] Setting audio mode for recording...');
-  await Audio.setAudioModeAsync({
-    allowsRecordingIOS: true,
-    playsInSilentModeIOS: true,
-    staysActiveInBackground: false,
-    shouldDuckAndroid: true,
-    playThroughEarpieceAndroid: false,
-  });
-
-  console.log('[VoiceService] Creating recording instance...');
-  const recording = new Audio.Recording();
-  await recording.prepareToRecordAsync({
-    android: {
-      extension: '.m4a',
-      outputFormat: 2,
-      audioEncoder: 3,
-      sampleRate: 16000,
-      numberOfChannels: 1,
-      bitRate: 64000,
-    },
-    ios: {
-      extension: '.wav',
-      outputFormat: 'lpcm',
-      audioQuality: 96,
-      sampleRate: 16000,
-      numberOfChannels: 1,
-      bitRate: 64000,
-      linearPCMBitDepth: 16,
-      linearPCMIsBigEndian: false,
-      linearPCMIsFloat: false,
-    },
-    web: {},
-  });
-
-  console.log('[VoiceService] Starting recording...');
-  await recording.startAsync();
-  console.log('[VoiceService] Recording started successfully');
-
-  return { recording, meteringCleanup: () => {} };
-}
-
-/**
- * Stop recording, get the file URI, and transcribe the audio.
- * Handles native (iOS/Android) and web differently: native fetch/FormData
- * accepts a { uri, name, type } reference, but web needs a real Blob.
- */
-export async function stopAndGetTranscript(
-  recording: Audio.Recording,
-  sttUrl: string,
-): Promise<string | null> {
-  try {
-    await recording.stopAndUnloadAsync();
-    console.log('[VoiceService] Recording stopped for transcription');
-  } catch (e) {
-    console.log('[VoiceService] Recording already stopped:', String(e).substring(0, 100));
-  }
-
-  const uri = recording.getURI();
-  if (!uri) {
-    console.log('[VoiceService] No recording URI — cannot transcribe');
-    return null;
-  }
-  console.log('[VoiceService] Recording URI:', uri, '| Platform:', Platform.OS);
-
-  const uriParts = uri.split('.');
-  const fileType = uriParts[uriParts.length - 1]?.split('?')[0] || (Platform.OS === 'web' ? 'webm' : 'm4a');
-  const mimeType = fileType === 'wav' ? 'audio/wav' : `audio/${fileType}`;
-
-  const formData = new FormData();
-
-  if (Platform.OS === 'web') {
-    // Web: the URI is a blob: URL — fetch it into a real Blob/File before upload.
-    try {
-      const blobResponse = await fetch(uri);
-      const blob = await blobResponse.blob();
-      const file = new File([blob], `voice.${fileType}`, { type: blob.type || mimeType });
-      formData.append('audio', file);
-    } catch (e) {
-      console.log('[VoiceService] Web blob conversion failed:', String(e).substring(0, 200));
-      return null;
+    if (voiceSettingsRef.current.autoListen) {
+      setTimeout(() => {
+        if (isMountedRef.current && phaseRef.current === 'idle') startListening();
+      }, 600);
     }
-  } else {
-    // Native (iOS/Android): pass the file reference directly.
-    formData.append('audio', {
-      uri,
-      name: `voice.${fileType}`,
-      type: mimeType,
-    } as unknown as Blob);
-  }
+  }, [onCoachMessage, startListening, stopAllInternal, startBargeMonitoring, stopBargeMonitoring, runSpeechQueue]);
 
-  formData.append('language', 'es');
+  processVoiceInputRef.current = processVoiceInput;
 
-  console.log('[VoiceService] Sending STT request to:', sttUrl);
-  try {
-    const response = await fetch(sttUrl, { method: 'POST', body: formData });
-    console.log('[VoiceService] STT response status:', response.status);
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.log('[VoiceService] STT error body:', errText.substring(0, 200));
-      return null;
+  // ── Tap orb handler ──────────────────────────────────────────────
+  const handleTapOrb = useCallback(() => {
+    if (phase === 'listening') {
+      processVoiceInput();
+    } else if (phase === 'idle' || phase === 'interrupted') {
+      startListening();
+    } else if (phase === 'speaking') {
+      stopSpeech();
+      setPhase('interrupted');
+      setStreamingText('');
+      setIsStreamingAI(false);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+      setTimeout(() => {
+        if (isMountedRef.current) startListening();
+      }, 400);
     }
-    const data = await response.json();
-    console.log('[VoiceService] STT result:', JSON.stringify(data).substring(0, 200));
-    return data.text?.trim() || null;
-  } catch (e) {
-    console.log('[VoiceService] STT network error:', String(e).substring(0, 200));
-    return null;
-  }
+  }, [phase, processVoiceInput, startListening]);
+
+  // ── Status label ─────────────────────────────────────────────────
+  const statusLabel = useMemo(() => {
+    switch (phase) {
+      case 'idle': return conversationStarted ? 'Escuchando...' : 'Toca para hablar';
+      case 'listening': return 'Escuchando...';
+      case 'thinking': return 'Procesando...';
+      case 'speaking': return 'Respondiendo...';
+      case 'interrupted': return 'Escuchando...';
+    }
+  }, [phase, conversationStarted]);
+
+  const hintText = useMemo(() => {
+    if (pipelineStep) return pipelineStep;
+    switch (phase) {
+      case 'idle': return conversationStarted ? 'Habla cuando quieras' : 'Toca el círculo para empezar';
+      case 'listening': return Platform.OS === 'web' ? 'Te escucho... toca cuando termines' : 'Te escucho...';
+      case 'thinking': return 'Procesando...';
+      case 'speaking': return 'Toca para interrumpir';
+      case 'interrupted': return 'Adelante, te escucho...';
+    }
+  }, [phase, conversationStarted, pipelineStep]);
+
+  // ── Auto-reset on mount ──────────────────────────────────────────
+  useEffect(() => {
+    if (visible) {
+      const t = setTimeout(() => {
+        if (isMountedRef.current) {
+          setConversationStarted(false);
+          setPhase('idle');
+          setTurns([]);
+          setStreamingText('');
+          setDetectedAthletes([]);
+        }
+      }, 300);
+      return () => clearTimeout(t);
+    }
+  }, [visible]);
+
+  // ── Render ───────────────────────────────────────────────────────
+  if (!visible) return null;
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="fade"
+      transparent={false}
+      onRequestClose={handleEndCall}
+      statusBarTranslucent
+    >
+      <StatusBar style="light" />
+      <Animated.View style={[styles.root, { opacity: fadeIn }]}>
+        {/* ── Glass top bar ─────────────────────────────────────── */}
+        <View style={styles.topBar}>
+          {/* Close */}
+          <TouchableOpacity
+            style={styles.closeBtn}
+            onPress={handleEndCall}
+            activeOpacity={0.5}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
+            <X size={20} color={TEXT_SECONDARY} />
+          </TouchableOpacity>
+
+          {/* Center */}
+          <View style={styles.topCenter}>
+            <Text style={styles.topTitle}>Sol</Text>
+          </View>
+
+          {/* Settings */}
+          <TouchableOpacity
+            style={styles.settingsBtn}
+            onPress={onOpenSettings}
+            activeOpacity={0.5}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
+            <Settings size={18} color={TEXT_TERTIARY} />
+          </TouchableOpacity>
+        </View>
+
+        {/* ── Athlete context chip ──────────────────────────────── */}
+        {detectedAthletes.length > 0 && (
+          <View style={styles.athleteChip}>
+            <User size={11} color={TEXT_SECONDARY} />
+            <Text style={styles.athleteChipText} numberOfLines={1}>
+              {detectedAthletes.map((a) => a.name).join(', ')}
+            </Text>
+          </View>
+        )}
+
+        {/* ── Transcript ────────────────────────────────────────── */}
+        <View style={styles.transcriptArea}>
+          <VoiceTranscript
+            turns={turns}
+            currentStreamingText={streamingText}
+            isStreaming={isStreamingAI}
+            phase={phase}
+            maxHeight={160}
+          />
+        </View>
+
+        {/* ── Orb centerpiece ───────────────────────────────────── */}
+        <View style={styles.orbSection}>
+          <TouchableOpacity
+            onPress={handleTapOrb}
+            activeOpacity={0.92}
+            style={styles.orbTouchable}
+          >
+            <VoiceOrb phase={phase} micLevel={micLevel} size={190} />
+          </TouchableOpacity>
+        </View>
+
+        {/* ── Status ────────────────────────────────────────────── */}
+        <View style={styles.statusSection}>
+          <Text style={styles.statusLabel}>{statusLabel}</Text>
+          <Text style={styles.hintText}>{hintText}</Text>
+          {errorMsg && (
+            <View style={styles.errorBanner}>
+              <Text style={styles.errorText}>{errorMsg}</Text>
+            </View>
+          )}
+        </View>
+
+        {/* ── Footer ────────────────────────────────────────────── */}
+        <Text style={styles.footer}>HGRAND AI</Text>
+      </Animated.View>
+    </Modal>
+  );
 }
 
+// ── Styles ────────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Cleanup
-// ---------------------------------------------------------------------------
+const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+    backgroundColor: BG,
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 56,
+    paddingBottom: 36,
+    paddingHorizontal: 24,
+  },
 
-export function cleanupVoiceService(): void {
-  isBargedIn = true;
-  if (currentSound) {
-    currentSound.unloadAsync().catch(() => {});
-    currentSound = null;
-  }
-}
+  // ── Top bar — frosted glass feel via surface + border ───────────
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+  },
+  closeBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: SURFACE_RAISED,
+    borderWidth: 0.5,
+    borderColor: BORDER,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  settingsBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: SURFACE_RAISED,
+    borderWidth: 0.5,
+    borderColor: BORDER,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  topCenter: {
+    alignItems: 'center',
+  },
+  topTitle: {
+    color: TEXT_PRIMARY,
+    fontSize: 18,
+    fontWeight: '600' as const,
+    letterSpacing: -0.25,
+  },
+
+  // ── Athlete chip ────────────────────────────────────────────────
+  athleteChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: SURFACE_RAISED,
+    borderRadius: 14,
+    paddingHorizontal: 11,
+    paddingVertical: 5,
+    marginTop: 10,
+    borderWidth: 0.5,
+    borderColor: BORDER,
+  },
+  athleteChipText: {
+    color: TEXT_SECONDARY,
+    fontSize: 11.5,
+    fontWeight: '500' as const,
+  },
+
+  // ── Transcript ──────────────────────────────────────────────────
+  transcriptArea: {
+    flex: 1,
+    width: '100%',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+
+  // ── Orb ─────────────────────────────────────────────────────────
+  orbSection: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  orbTouchable: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // ── Status ──────────────────────────────────────────────────────
+  statusSection: {
+    alignItems: 'center',
+    marginTop: 22,
+    gap: 5,
+  },
+  statusLabel: {
+    color: TEXT_PRIMARY,
+    fontSize: 16,
+    fontWeight: '600' as const,
+    letterSpacing: -0.2,
+  },
+  hintText: {
+    color: TEXT_TERTIARY,
+    fontSize: 13,
+    fontWeight: '400' as const,
+  },
+
+  // ── Error ───────────────────────────────────────────────────────
+  errorBanner: {
+    marginTop: 10,
+    backgroundColor: DANGER_BG,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderWidth: 0.5,
+    borderColor: DANGER_BORDER,
+  },
+  errorText: {
+    color: DANGER,
+    fontSize: 12,
+    fontWeight: '500' as const,
+    textAlign: 'center' as const,
+  },
+
+  // ── Footer ──────────────────────────────────────────────────────
+  footer: {
+    color: TEXT_QUATERNARY,
+    fontSize: 10,
+    fontWeight: '500' as const,
+    letterSpacing: 1.8,
+    textTransform: 'uppercase' as const,
+  },
+});
