@@ -1,31 +1,194 @@
 // functions/index.ts
 // Worker entrypoint for HGRAND OS backend.
-// Routes all /api/* requests to the CoachData Durable Object,
-// keyed by the authenticated coach's user ID.
+// Routes app APIs to the CoachData Durable Object and keeps provider secrets
+// server-side for realtime voice.
 
 export { CoachData } from "./coach-data";
 
 type Env = {
   DO: Fetcher;
+  OPENAI_API_KEY?: string;
 };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Rork-User-Id",
 };
+
+function withCors(response: Response): Promise<Response> {
+  return response.text().then((body) => new Response(body, {
+    status: response.status,
+    headers: {
+      ...CORS,
+      "Content-Type": response.headers.get("Content-Type") ?? "application/json",
+    },
+  }));
+}
+
+function coachIdFrom(request: Request): string {
+  return request.headers.get("X-Rork-User-Id") ?? "demo-coach";
+}
+
+function toDurableObjectRequest(
+  original: Request,
+  url: URL,
+  coachId: string,
+  init?: RequestInit,
+): Request {
+  const wrapped = new Request(url.toString(), init ?? original);
+  wrapped.headers.set("X-Rork-DO-Class", "CoachData");
+  wrapped.headers.set("X-Rork-DO-Id", coachId);
+  return wrapped;
+}
+
+async function forwardToCoachData(
+  request: Request,
+  env: Env,
+  targetUrl?: URL,
+  init?: RequestInit,
+): Promise<Response> {
+  const url = targetUrl ?? new URL(request.url);
+  const wrapped = toDurableObjectRequest(request, url, coachIdFrom(request), init);
+  return env.DO.fetch(wrapped);
+}
+
+async function handleNutritionPlanRoute(
+  request: Request,
+  env: Env,
+  studentId: string,
+): Promise<Response> {
+  const method = request.method;
+  const studentUrl = new URL(request.url);
+  studentUrl.pathname = `/api/students/${studentId}`;
+  studentUrl.search = "";
+
+  if (method === "GET") {
+    const response = await forwardToCoachData(request, env, studentUrl, { method: "GET", headers: request.headers });
+    if (!response.ok) return response;
+    const student = await response.json() as Record<string, unknown>;
+    return Response.json(student.nutritionPlan ?? null);
+  }
+
+  if (method === "PUT") {
+    const nutritionPlan = await request.json();
+    return forwardToCoachData(request, env, studentUrl, {
+      method: "PUT",
+      headers: request.headers,
+      body: JSON.stringify({ nutritionPlan }),
+    });
+  }
+
+  if (method === "DELETE") {
+    return forwardToCoachData(request, env, studentUrl, {
+      method: "PUT",
+      headers: request.headers,
+      body: JSON.stringify({ nutritionPlan: null }),
+    });
+  }
+
+  return Response.json({ error: "method not allowed" }, { status: 405 });
+}
+
+/**
+ * Server-side WebRTC SDP bridge for OpenAI Realtime. The long-lived API key
+ * never reaches the mobile client. This endpoint is intentionally not wired to
+ * the UI yet: the React Native app still needs a WebRTC transport plus Sol's
+ * tool/memory sideband before realtime can replace the current fallback safely.
+ */
+async function handleRealtimeCall(request: Request, env: Env): Promise<Response> {
+  if (!env.OPENAI_API_KEY) {
+    return Response.json(
+      { error: "OPENAI_API_KEY is not configured on the Functions service" },
+      { status: 503 },
+    );
+  }
+
+  const body = await request.json() as {
+    sdp?: string;
+    instructions?: string;
+    voice?: string;
+  };
+
+  if (!body.sdp?.trim()) {
+    return Response.json({ error: "sdp is required" }, { status: 400 });
+  }
+
+  const session = {
+    type: "realtime",
+    model: "gpt-realtime",
+    output_modalities: ["audio"],
+    instructions: body.instructions ||
+      "Eres Sol, el asistente de voz profesional de HGRAND OS. Habla en español natural, directo y conciso. No inventes datos de atletas.",
+    audio: {
+      input: {
+        transcription: {
+          model: "gpt-4o-mini-transcribe",
+          language: "es",
+        },
+        turn_detection: {
+          type: "semantic_vad",
+          eagerness: "auto",
+          create_response: true,
+          interrupt_response: true,
+        },
+      },
+      output: {
+        voice: body.voice || "marin",
+        speed: 1,
+      },
+    },
+  };
+
+  const form = new FormData();
+  form.append("sdp", new Blob([body.sdp], { type: "application/sdp" }), "offer.sdp");
+  form.append("session", new Blob([JSON.stringify(session)], { type: "application/json" }), "session.json");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/realtime/calls", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      },
+      body: form,
+      signal: controller.signal,
+    });
+
+    const answer = await response.text();
+    return new Response(answer, {
+      status: response.status,
+      headers: {
+        "Content-Type": response.headers.get("Content-Type") ?? "application/sdp",
+        ...(response.headers.get("Location")
+          ? { "X-HGRAND-Realtime-Call": response.headers.get("Location")! }
+          : {}),
+      },
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return Response.json({ error: "OpenAI Realtime connection timed out" }, { status: 504 });
+    }
+    return Response.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      { status: 502 },
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method;
 
-    // Handle CORS preflight
     if (method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // Health check (no auth needed)
     if (url.pathname === "/ping") {
       return Response.json(
         { ok: true, now: new Date().toISOString(), service: "hgrand-backend" },
@@ -33,36 +196,24 @@ export default {
       );
     }
 
-    // WebSocket upgrade for real-time voice sessions
-    const upgrade = request.headers.get("Upgrade");
-    if (upgrade === "websocket" && url.pathname === "/api/voice-session") {
-      const coachId = request.headers.get("X-Rork-User-Id") ?? "demo-coach";
-      const wrapped = new Request(request.url, request);
-      wrapped.headers.set("X-Rork-DO-Class", "CoachData");
-      wrapped.headers.set("X-Rork-DO-Id", coachId);
-      return env.DO.fetch(wrapped);
+    if (url.pathname === "/api/realtime/call" && method === "POST") {
+      return withCors(await handleRealtimeCall(request, env));
     }
 
-    // All API routes go through the CoachData DO
+    // Compatibility route: the client already exposes nutrition-plan APIs, but
+    // CoachData historically stored the active plan inside the student object.
+    const nutritionMatch = url.pathname.match(/^\/api\/students\/([^/]+)\/nutrition-plan$/);
+    if (nutritionMatch) {
+      return withCors(await handleNutritionPlanRoute(request, env, nutritionMatch[1]));
+    }
+
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade === "websocket" && url.pathname === "/api/voice-session") {
+      return forwardToCoachData(request, env);
+    }
+
     if (url.pathname.startsWith("/api/")) {
-      const coachId = request.headers.get("X-Rork-User-Id") ?? "demo-coach";
-
-      // Wrap with 2-arg form to preserve headers
-      const wrapped = new Request(request.url, request);
-      wrapped.headers.set("X-Rork-DO-Class", "CoachData");
-      wrapped.headers.set("X-Rork-DO-Id", coachId);
-
-      const response = await env.DO.fetch(wrapped);
-
-      // Add CORS headers to DO responses
-      const body = await response.text();
-      return new Response(body, {
-        status: response.status,
-        headers: {
-          ...CORS,
-          "Content-Type": response.headers.get("Content-Type") ?? "application/json",
-        },
-      });
+      return withCors(await forwardToCoachData(request, env));
     }
 
     return Response.json({ error: "not found" }, { status: 404, headers: CORS });
