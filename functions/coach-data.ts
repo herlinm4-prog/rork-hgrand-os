@@ -351,8 +351,8 @@ export class CoachData extends DurableObject {
       const docDupMatch = path.match(/^\/api\/students\/([^/]+)\/documents\/([^/]+)\/duplicate$/);
       if (docDupMatch && method === "POST") {
         const [, sid, did] = docDupMatch;
-        const { targetFolderId } = await request.json() as { targetFolderId?: string };
-        return this.#duplicateDocument(sid, did, targetFolderId);
+        const { targetFolderId, id: newId } = await request.json() as { targetFolderId?: string; id?: string };
+        return this.#duplicateDocument(sid, did, targetFolderId, newId);
       }
 
       // Training plan
@@ -475,8 +475,12 @@ export class CoachData extends DurableObject {
       return json({ error: "not found" }, 404);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error("CoachData error:", message);
-      return json({ error: message }, 500);
+      // Log the detail server-side, but never echo raw error text (which can
+      // include SQL fragments, column names and stored values) back to the
+      // caller — that hands an attacker a free map of the schema.
+      const ref = crypto.randomUUID().slice(0, 8);
+      console.error(`CoachData error [${ref}] on ${method} ${path}:`, message);
+      return json({ error: "internal error", ref }, 500);
     }
   }
 
@@ -494,7 +498,7 @@ export class CoachData extends DurableObject {
   #getStudent(id: string): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM students WHERE id = ?", id)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "student not found" }, 404);
     return json(JSON.parse(row.data));
   }
@@ -524,7 +528,7 @@ export class CoachData extends DurableObject {
   #updateStudent(id: string, partial: Record<string, unknown>): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM students WHERE id = ?", id)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "student not found" }, 404);
 
     const existing = JSON.parse(row.data);
@@ -557,7 +561,7 @@ export class CoachData extends DurableObject {
   #addCheckIn(studentId: string, body: Record<string, unknown>): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM students WHERE id = ?", studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "student not found" }, 404);
 
     const checkIn = {
@@ -629,7 +633,7 @@ export class CoachData extends DurableObject {
   #updateDocument(studentId: string, docId: string, partial: Record<string, unknown>): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM documents WHERE id = ? AND student_id = ?", docId, studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "document not found" }, 404);
     const existing = JSON.parse(row.data);
     const merged = { ...existing, ...partial, updatedAt: nowISO() };
@@ -650,7 +654,7 @@ export class CoachData extends DurableObject {
   #moveDocument(studentId: string, docId: string, targetFolderId?: string): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM documents WHERE id = ? AND student_id = ?", docId, studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "document not found" }, 404);
     const existing = JSON.parse(row.data);
     const merged = { ...existing, folderId: targetFolderId, updatedAt: nowISO() };
@@ -663,16 +667,19 @@ export class CoachData extends DurableObject {
     return json(merged);
   }
 
-  #duplicateDocument(studentId: string, docId: string, targetFolderId?: string): Response {
+  #duplicateDocument(studentId: string, docId: string, targetFolderId?: string, newId?: string): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM documents WHERE id = ? AND student_id = ?", docId, studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "document not found" }, 404);
     const existing = JSON.parse(row.data);
     const now = nowISO();
     const newDoc = {
       ...existing,
-      id: Date.now().toString(),
+      // Honour the client-generated id when present, otherwise mint one.
+      // Without this the client and server end up with two different ids
+      // for the same duplicated document.
+      id: newId ?? Date.now().toString(),
       name: `${existing.name ?? "Documento"} (copia)`,
       folderId: targetFolderId ?? existing.folderId,
       createdAt: now,
@@ -722,7 +729,7 @@ export class CoachData extends DurableObject {
   #updateFolder(studentId: string, folderId: string, partial: Record<string, unknown>): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM folders WHERE id = ? AND student_id = ?", folderId, studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "folder not found" }, 404);
     const existing = JSON.parse(row.data);
     const merged = { ...existing, ...partial, updatedAt: nowISO() };
@@ -762,7 +769,7 @@ export class CoachData extends DurableObject {
   #moveFolder(studentId: string, folderId: string, targetParentId?: string): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM folders WHERE id = ? AND student_id = ?", folderId, studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "folder not found" }, 404);
     const existing = JSON.parse(row.data);
     const merged = { ...existing, parentId: targetParentId, updatedAt: nowISO() };
@@ -782,7 +789,7 @@ export class CoachData extends DurableObject {
   #getTrainingPlan(studentId: string): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM training_plans WHERE student_id = ?", studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json(null);
     return json(JSON.parse(row.data));
   }
@@ -1018,7 +1025,7 @@ export class CoachData extends DurableObject {
         "SELECT data FROM metabolic_analyses WHERE student_id = ? ORDER BY date DESC LIMIT 1",
         studentId,
       )
-      .one();
+      .toArray()[0];
     if (!row) return json(null);
     return json(JSON.parse(row.data));
   }
@@ -1026,7 +1033,7 @@ export class CoachData extends DurableObject {
   #runMetabolicAnalysis(studentId: string): Response {
     const row = this.ctx.storage.sql
       .exec<{ data: string }>("SELECT data FROM students WHERE id = ?", studentId)
-      .one();
+      .toArray()[0];
     if (!row) return json({ error: "student not found" }, 404);
 
     const student = JSON.parse(row.data) as Record<string, unknown>;
@@ -1625,7 +1632,7 @@ export class CoachData extends DurableObject {
         if (existingRec && existingRec.count > 0) continue;
         const lastPanel = this.ctx.storage.sql
           .exec<{ data: string }>("SELECT data FROM blood_panels WHERE student_id = ? AND category = ? ORDER BY date DESC LIMIT 1", studentId, panel)
-          .one();
+          .toArray()[0];
         let needsPanel = true;
         if (lastPanel) {
           const lp = JSON.parse(lastPanel.data);

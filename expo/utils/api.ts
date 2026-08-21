@@ -32,6 +32,39 @@ if (!BACKEND_URL) {
 }
 
 // ---------------------------------------------------------------------------
+// Session token
+// ---------------------------------------------------------------------------
+//
+// The backend derives the coach identity from this token. It is held in memory
+// and mirrored to AsyncStorage by AuthContext; api.ts never reads storage
+// directly so there is exactly one place that decides who we are.
+
+let authToken: string | null = null;
+let onUnauthorized: (() => void) | null = null;
+
+export function setAuthToken(token: string | null): void {
+  authToken = token;
+}
+
+export function getAuthToken(): string | null {
+  return authToken;
+}
+
+/** Registered by AuthContext so an expired token forces a clean logout. */
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Internal fetch helper
 // ---------------------------------------------------------------------------
 
@@ -40,22 +73,54 @@ async function apiFetch<T>(
   options: RequestInit = {}
 ): Promise<T> {
   const url = `${BACKEND_URL}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options.headers as Record<string, string> | undefined),
+  };
+  if (authToken) {
+    headers.Authorization = `Bearer ${authToken}`;
+  }
+
+  const res = await fetch(url, { ...options, headers });
+
+  if (res.status === 401) {
+    authToken = null;
+    onUnauthorized?.();
+    throw new ApiError(401, "Sesión expirada");
+  }
 
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status} on ${path}: ${body}`);
+    await res.text().catch(() => "");
+    // Don't fold the raw response body into the message — it can end up in
+    // logs or on screen. Keep it short and typed.
+    throw new ApiError(res.status, `API ${res.status} on ${path}`);
   }
 
   const text = await res.text();
   if (!text) return undefined as unknown as T;
   return JSON.parse(text) as T;
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+export interface LoginResult {
+  token: string;
+  expiresAt: number;
+  coach: { id: string; email: string };
+}
+
+export async function login(email: string, password: string): Promise<LoginResult> {
+  const res = await fetch(`${BACKEND_URL}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    throw new ApiError(res.status, res.status === 401 ? "Credenciales incorrectas" : "No se pudo iniciar sesión");
+  }
+  return (await res.json()) as LoginResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,11 +226,12 @@ export async function moveDocument(
 export async function duplicateDocument(
   studentId: string,
   docId: string,
-  targetFolderId?: string
+  targetFolderId?: string,
+  newId?: string
 ): Promise<StudentDocument> {
   return apiFetch<StudentDocument>(
     `/api/students/${studentId}/documents/${docId}/duplicate`,
-    { method: "POST", body: JSON.stringify({ targetFolderId }) }
+    { method: "POST", body: JSON.stringify({ targetFolderId, id: newId }) }
   );
 }
 

@@ -6,9 +6,13 @@ import { Audio } from 'expo-av';
 import { Platform } from 'react-native';
 
 import { VOICE_PRESETS, VOICE_SPEED_SETTINGS, type VoiceSpeed } from '@/types/settings';
+import { getAuthToken } from '@/utils/api';
 
-const TOOLKIT_URL = process.env.EXPO_PUBLIC_TOOLKIT_URL || 'https://toolkit.rork.com';
-const TOOLKIT_KEY = process.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY || '';
+// The ElevenLabs key is NOT held here any more. Anything prefixed with
+// EXPO_PUBLIC_ is compiled into the app bundle, so shipping a secret that way
+// means publishing it. TTS now goes through our own authenticated backend,
+// which holds the key server-side. See functions/index.ts -> /api/tts.
+const BACKEND_URL = process.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL || '';
 
 // ---------------------------------------------------------------------------
 // Voice IDs
@@ -73,32 +77,29 @@ export function chunkForStreamingTTS(text: string): string[] {
  * Returns a base64 data URI to the MP3 audio.
  */
 async function synthesizeChunk(text: string, voiceId: string = VOICE_ID_SOL, speed?: VoiceSpeed): Promise<string> {
-  const url = `${TOOLKIT_URL}/v2/elevenlabs/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`;
   const voiceSettings = getVoiceSettingsFromSpeed(speed ?? 'normal');
+  const token = getAuthToken();
 
   console.log('[VoiceService] Synthesizing chunk:', text.substring(0, 80), '| voice:', voiceId);
-  console.log('[VoiceService] Toolkit URL:', TOOLKIT_URL, '| Key prefix:', TOOLKIT_KEY.substring(0, 8) + '...');
 
-  const response = await fetch(url, {
+  if (!token) {
+    throw new Error('TTS requires an authenticated session');
+  }
+
+  const response = await fetch(`${BACKEND_URL}/api/tts`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${TOOLKIT_KEY}`,
+      'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      text,
-      model_id: 'eleven_flash_v2_5',
-      voice_settings: {
-        ...voiceSettings,
-        use_speaker_boost: true,
-      },
-    }),
+    body: JSON.stringify({ text, voiceId, voiceSettings }),
   });
 
   if (!response.ok) {
-    const errText = await response.text().catch(() => 'Unknown error');
-    console.log('[VoiceService] TTS API error — status:', response.status, '| body:', errText.substring(0, 300));
-    throw new Error(`TTS failed (${response.status}): ${errText}`);
+    // 401 means the session token expired mid-conversation; api.ts owns the
+    // logout path, so just surface it rather than retrying blindly.
+    console.log('[VoiceService] TTS error — status:', response.status);
+    throw new Error(`TTS failed (${response.status})`);
   }
 
   const arrayBuffer = await response.arrayBuffer();
@@ -171,29 +172,42 @@ async function playChunk(audioUri: string): Promise<void> {
 
   return new Promise<void>((resolve, reject) => {
     let resolved = false;
+    // Safety timeout: 30 seconds per chunk. Cleared as soon as playback
+    // settles, so a long reply doesn't leave a pending timer per chunk.
+    let safetyTimer: ReturnType<typeof setTimeout> | null = null;
+    const settle = (fn: () => void) => {
+      resolved = true;
+      if (safetyTimer !== null) {
+        clearTimeout(safetyTimer);
+        safetyTimer = null;
+      }
+      fn();
+    };
 
     sound.setOnPlaybackStatusUpdate((status) => {
       if (!status.isLoaded) return;
       if (isBargedIn && !resolved) {
-        resolved = true;
-        sound.stopAsync().catch(() => {});
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        reject(new Error('barged-in'));
+        settle(() => {
+          sound.stopAsync().catch(() => {});
+          sound.unloadAsync().catch(() => {});
+          currentSound = null;
+          reject(new Error('barged-in'));
+        });
         return;
       }
       if (status.didJustFinish && !resolved) {
-        resolved = true;
-        sound.unloadAsync().catch(() => {});
-        currentSound = null;
-        resolve();
+        settle(() => {
+          sound.unloadAsync().catch(() => {});
+          currentSound = null;
+          resolve();
+        });
       }
     });
 
-    // Safety timeout: 30 seconds per chunk
-    setTimeout(() => {
+    safetyTimer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        safetyTimer = null;
         sound.unloadAsync().catch(() => {});
         currentSound = null;
         resolve();
@@ -432,9 +446,37 @@ export function detectAthleteContext(
   transcript: string,
   students: Array<{ id: string; name: string }>,
 ): string[] {
-  const lowerText = transcript.toLowerCase();
+  // Plain substring matching over free-form speech produced false hits:
+  // an athlete named "Sol" matched "solo"/"solamente", "Ana" matched "Anabel".
+  // Match on whole words instead, and accept either the full name or any
+  // single name part (first name / surname) as long as it is 3+ chars.
+  const normalize = (t: string) =>
+    t
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+
+  const words = new Set(normalize(transcript).split(/[^a-z0-9]+/).filter(Boolean));
+  const normalizedTranscript = normalize(transcript);
+
+  // A full multi-word name spoken verbatim is the strongest signal — when one
+  // is present, prefer it outright. Otherwise two athletes sharing a first
+  // name ("Ana Torres" / "Ana Maria Ruiz") would both light up.
+  const fullNameHits = students.filter((s) => {
+    const fullName = normalize(s.name).trim();
+    return fullName.includes(' ') && normalizedTranscript.includes(fullName);
+  });
+  if (fullNameHits.length > 0) return fullNameHits.map((s) => s.id);
+
   return students
-    .filter((s) => lowerText.includes(s.name.toLowerCase()))
+    .filter((s) => {
+      const fullName = normalize(s.name).trim();
+      if (!fullName) return false;
+      return fullName
+        .split(/\s+/)
+        .filter((part) => part.length >= 3)
+        .some((part) => words.has(part));
+    })
     .map((s) => s.id);
 }
 
@@ -470,6 +512,10 @@ export async function setupContinuousRecording(): Promise<RecordingSetup> {
   console.log('[VoiceService] Creating recording instance...');
   const recording = new Audio.Recording();
   await recording.prepareToRecordAsync({
+    // REQUIRED: without this, status.metering is undefined and every
+    // downstream consumer (silence detection, barge-in, mic level UI)
+    // silently sees -160 dBFS forever.
+    isMeteringEnabled: true,
     android: {
       extension: '.m4a',
       outputFormat: 2,

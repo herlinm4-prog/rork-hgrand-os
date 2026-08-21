@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import createContextHook from '@nkzw/create-context-hook';
 import { Student, CheckIn, StudentDocument, StudentFolder, TrainingPlan, NutritionPlan, DietHistoryEntry } from '@/types';
@@ -11,6 +11,8 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
   const [students, setStudents] = useState<Student[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSynced, setIsSynced] = useState<boolean>(false);
+  // Mirror of `students` that is always current within the same tick.
+  const studentsRef = useRef<Student[]>([]);
 
   useEffect(() => {
     const loadStudents = async () => {
@@ -18,6 +20,7 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
         // 1. Try to load from backend first
         const remote = await api.fetchStudents();
         if (remote && remote.length > 0) {
+          studentsRef.current = remote;
           setStudents(remote);
           setIsSynced(true);
           // Cache locally for offline fallback
@@ -31,17 +34,20 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
           const stored = await AsyncStorage.getItem(STORAGE_KEY);
           if (stored) {
             const parsed = JSON.parse(stored) as Student[];
+            studentsRef.current = parsed;
             setStudents(parsed);
             // Try to migrate in background
             api.migrateStudents(parsed).then(() => setIsSynced(true)).catch(() => {});
           } else {
             // 3. Last resort: mock data, then migrate
+            studentsRef.current = mockStudents;
             setStudents(mockStudents);
             await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(mockStudents));
             api.migrateStudents(mockStudents).then(() => setIsSynced(true)).catch(() => {});
           }
         } catch (e) {
           console.log('Error loading students:', e);
+          studentsRef.current = mockStudents;
           setStudents(mockStudents);
           await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(mockStudents));
         }
@@ -53,15 +59,37 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
   }, []);
 
   const saveStudents = useCallback(async (updated: Student[]) => {
+    studentsRef.current = updated;
     setStudents(updated);
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
   }, []);
 
+  /**
+   * Apply a mutation against the LATEST students state, not a stale closure copy.
+   * Two mutations firing in the same tick (e.g. a check-in that also bumps weight,
+   * or the AI writing a document while the profile is being edited) used to clobber
+   * each other because both read `students` from their own closure.
+   *
+   * Uses a mirror ref rather than setStudents(prev => ...) because the functional
+   * updater does not run synchronously — we need the resulting array immediately
+   * in order to persist it.
+   */
+  const mutateStudents = useCallback(
+    async (mutator: (prev: Student[]) => Student[]): Promise<Student[]> => {
+      const next = mutator(studentsRef.current);
+      studentsRef.current = next;
+      setStudents(next);
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      return next;
+    },
+    []
+  );
+
   const addStudent = useCallback(async (student: Omit<Student, 'id' | 'checkIns' | 'createdAt'>) => {
     try {
       const created = await api.createStudent(student);
-      const updated = [...students, created];
-      await saveStudents(updated);
+      const updated = (prev: Student[]) => [...prev, created];
+      await mutateStudents(updated);
       return created;
     } catch {
       // Fallback to local-only
@@ -71,31 +99,31 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
         checkIns: [],
         createdAt: new Date().toISOString().split('T')[0],
       };
-      const updated = [...students, newStudent];
-      await saveStudents(updated);
+      const updated = (prev: Student[]) => [...prev, newStudent];
+      await mutateStudents(updated);
       return newStudent;
     }
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const updateStudent = useCallback(async (id: string, data: Partial<Student>) => {
-    const updated = students.map((s) => (s.id === id ? { ...s, ...data } : s));
-    await saveStudents(updated);
+    const updated = (prev: Student[]) => prev.map((s) => (s.id === id ? { ...s, ...data } : s));
+    await mutateStudents(updated);
     // Sync to backend in background
     api.updateStudent(id, data).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const deleteStudent = useCallback(async (id: string) => {
-    const updated = students.filter((s) => s.id !== id);
-    await saveStudents(updated);
+    const updated = (prev: Student[]) => prev.filter((s) => s.id !== id);
+    await mutateStudents(updated);
     api.deleteStudent(id).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const addCheckIn = useCallback(async (studentId: string, checkIn: Omit<CheckIn, 'id'>) => {
     const newCheckIn: CheckIn = {
       ...checkIn,
       id: Date.now().toString(),
     };
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return {
           ...s,
@@ -106,11 +134,11 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     // Sync to backend
     api.addCheckIn(studentId, newCheckIn).catch(() => {});
     return newCheckIn;
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const getStudent = useCallback((id: string): Student | undefined => {
     return students.find((s) => s.id === id);
@@ -124,30 +152,30 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       createdAt: now,
       updatedAt: now,
     };
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, documents: [...(s.documents || []), newDoc] };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.addDocument(studentId, newDoc).catch(() => {});
     return newDoc;
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const deleteDocument = useCallback(async (studentId: string, docId: string) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, documents: (s.documents || []).filter((d) => d.id !== docId) };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.deleteDocument(studentId, docId).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const updateDocument = useCallback(async (studentId: string, docId: string, data: Partial<StudentDocument>) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return {
           ...s,
@@ -158,9 +186,9 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.updateDocument(studentId, docId, data).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const addFolder = useCallback(async (studentId: string, folder: Omit<StudentFolder, 'id' | 'createdAt' | 'updatedAt'>) => {
     const now = new Date().toISOString();
@@ -170,19 +198,19 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       createdAt: now,
       updatedAt: now,
     };
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, folders: [...(s.folders || []), newFolder] };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.addFolder(studentId, newFolder).catch(() => {});
     return newFolder;
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const updateFolder = useCallback(async (studentId: string, folderId: string, data: Partial<StudentFolder>) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return {
           ...s,
@@ -193,16 +221,16 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.updateFolder(studentId, folderId, data).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const deleteFolder = useCallback(async (studentId: string, folderId: string) => {
     const collectFolderIds = (id: string, allFolders: StudentFolder[]): string[] => {
       const children = allFolders.filter((f) => f.parentId === id);
       return [id, ...children.flatMap((c) => collectFolderIds(c.id, allFolders))];
     };
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         const allFolders = s.folders || [];
         const idsToDelete = collectFolderIds(folderId, allFolders);
@@ -214,69 +242,69 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.deleteFolder(studentId, folderId).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const updateTrainingPlan = useCallback(async (studentId: string, plan: TrainingPlan) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, trainingPlan: plan };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.upsertTrainingPlan(studentId, plan).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const deleteTrainingPlan = useCallback(async (studentId: string) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, trainingPlan: undefined };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.deleteTrainingPlan(studentId).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const updateNutritionPlan = useCallback(async (studentId: string, plan: NutritionPlan) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, nutritionPlan: plan };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.upsertNutritionPlan(studentId, plan).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const deleteNutritionPlan = useCallback(async (studentId: string) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, nutritionPlan: undefined };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.deleteNutritionPlan(studentId).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const addDietHistoryEntry = useCallback(async (studentId: string, entry: Omit<DietHistoryEntry, 'id'>) => {
     const newEntry: DietHistoryEntry = {
       ...entry,
       id: Date.now().toString(),
     };
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, dietHistory: [...(s.dietHistory || []), newEntry] };
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.addDietEntry(studentId, newEntry).catch(() => {});
     return newEntry;
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const getDietHistory = useCallback((studentId: string): DietHistoryEntry[] => {
     const student = students.find((s) => s.id === studentId);
@@ -297,7 +325,7 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
   }, [students]);
 
   const moveDocument = useCallback(async (studentId: string, docId: string, targetFolderId: string | undefined) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return {
           ...s,
@@ -308,12 +336,12 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.moveDocument(studentId, docId, targetFolderId).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const duplicateDocument = useCallback(async (studentId: string, docId: string, targetFolderId?: string) => {
-    const student = students.find(s => s.id === studentId);
+    const student = studentsRef.current.find(s => s.id === studentId);
     const doc = student?.documents?.find(d => d.id === docId);
     if (!doc) return;
     const now = new Date().toISOString();
@@ -325,19 +353,19 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       createdAt: now,
       updatedAt: now,
     };
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return { ...s, documents: [...(s.documents || []), newDoc] };
       }
       return s;
     });
-    await saveStudents(updated);
-    api.duplicateDocument(studentId, docId, targetFolderId).catch(() => {});
+    await mutateStudents(updated);
+    api.duplicateDocument(studentId, docId, targetFolderId, newDoc.id).catch(() => {});
     return newDoc;
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const moveFolder = useCallback(async (studentId: string, folderId: string, targetParentId: string | undefined) => {
-    const updated = students.map((s) => {
+    const updated = (prev: Student[]) => prev.map((s) => {
       if (s.id === studentId) {
         return {
           ...s,
@@ -348,9 +376,9 @@ export const [StudentsProvider, useStudents] = createContextHook(() => {
       }
       return s;
     });
-    await saveStudents(updated);
+    await mutateStudents(updated);
     api.moveFolder(studentId, folderId, targetParentId).catch(() => {});
-  }, [students, saveStudents]);
+  }, [mutateStudents]);
 
   const stats = useMemo(() => {
     const totalCheckIns = students.reduce((sum, s) => sum + s.checkIns.length, 0);

@@ -77,6 +77,7 @@ import { shareAsync } from 'expo-sharing';
 import type { QuickTool } from '@/types/ai';
 import { useSettings } from '@/contexts/SettingsContext';
 import { generateHgrandNutritionPdfHtml } from '@/utils/nutritionPdfGenerator';
+import { parseNum, resolveStudentByName } from '@/utils/calculations';
 
 const STT_URL = 'https://toolkit.rork.com/stt/transcribe/';
 
@@ -418,9 +419,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre o parte del nombre del alumno'),
         }),
         execute(params) {
-          const found = students.find(s =>
-            s.name.toLowerCase().includes(params.studentName.toLowerCase())
-          );
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           const lastCheckIn = found.checkIns.length > 0 ? found.checkIns[found.checkIns.length - 1] : null;
           return JSON.stringify({
@@ -450,9 +450,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre o parte del nombre del alumno'),
         }),
         execute(params) {
-          const found = students.find(s =>
-            s.name.toLowerCase().includes(params.studentName.toLowerCase())
-          );
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           const checkIns = found.checkIns;
           const sortedCheckIns = [...checkIns].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
@@ -571,7 +570,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         description: 'Obtener el historial completo de dietas de un alumno.',
         zodSchema: z.object({ studentName: z.string().describe('Nombre del alumno') }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const history = getDietHistory(found.id);
           if (history.length === 0) {
@@ -591,7 +591,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         description: 'Listar documentos y carpetas de un alumno.',
         zodSchema: z.object({ studentName: z.string().describe('Nombre del alumno'), folderId: z.string().optional().describe('ID de carpeta') }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const docs = getStudentDocuments(found.id, params.folderId);
           const folders = getStudentFolders(found.id);
@@ -602,7 +603,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         description: 'Leer el contenido de un documento.',
         zodSchema: z.object({ studentName: z.string().describe('Nombre del alumno'), documentId: z.string().describe('ID del documento') }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const doc = (found.documents || []).find(d => d.id === params.documentId);
           if (!doc) return 'Documento no encontrado';
@@ -617,7 +619,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           content: z.string(), folderName: z.string().optional(), notes: z.string().optional(),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           let folderId: string | undefined;
           if (params.folderName) {
@@ -639,7 +642,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           changes: z.string().optional(), notes: z.string().optional(),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           try {
             await addDietHistoryEntry(found.id, { studentId: found.id, date: new Date().toISOString(), calories: params.calories, protein: params.protein, carbs: params.carbs, fats: params.fats, planTitle: params.planTitle, changes: params.changes, notes: params.notes, createdBy: 'ai' });
@@ -761,7 +765,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           days: z.string(), notes: z.string().optional(),
         }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return JSON.stringify({ success: false, message: 'Alumno no encontrado' });
           const date = new Date().toLocaleDateString('es-ES', { year: 'numeric', month: 'long', day: 'numeric' });
           const phaseLabels: Record<string, string> = { hypertrophy: 'Hipertrofia', strength: 'Fuerza', peaking: 'Pico', deload: 'Descarga', maintenance: 'Mantenimiento' };
@@ -800,7 +805,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           compareWithPrevious: z.boolean().optional().describe('Comparar con check-in anterior'),
         }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const sortedCheckIns = [...found.checkIns].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
           const latest = sortedCheckIns[0];
@@ -836,7 +842,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           currentBodyFat: z.number().optional().describe('% grasa actual'),
         }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const weight = params.currentWeight || found.weight;
           const bf = params.currentBodyFat || found.bodyFatPercentage;
@@ -857,7 +864,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           weeks: z.number().optional().describe('Número de semanas a resumir'),
         }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const weeksBack = params.weeks || 4;
           const cutoff = new Date();
@@ -882,7 +890,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           context: z.string().optional().describe('Contexto del mensaje (ej: progreso lento, buen progreso, check-in pendiente)'),
         }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           const lastCheckIn = found.checkIns.length > 0 ? found.checkIns[found.checkIns.length - 1] : null;
           return JSON.stringify({
@@ -925,7 +934,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           };
 
           if (params.studentName) {
-            const found = students.find(s => s.name.toLowerCase().includes(params.studentName!.toLowerCase()));
+            const { match: found } = resolveStudentByName(params.studentName, students);
             if (found) {
               const lastCheckIn = found.checkIns.length > 0 ? found.checkIns[found.checkIns.length - 1] : null;
               const prevCheckIn = found.checkIns.length > 1 ? found.checkIns[found.checkIns.length - 2] : null;
@@ -1013,7 +1022,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre exacto del alumno'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           try {
             const analysis = await apiRunMetabolic(found.id);
@@ -1035,7 +1045,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre del alumno'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           try {
             const memory = await fetchAthleteMemory(found.id);
@@ -1067,7 +1078,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           metadata: z.string().optional().describe('Metadatos JSON (opcional): plan antes/después, cambios de suplementos, IDs de análisis, etc.'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           try {
             let meta = {};
@@ -1090,7 +1102,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre del alumno'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           try {
             // First ensure metabolic analysis exists
@@ -1121,7 +1134,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre del alumno'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           try {
             const risks = await fetchPlanRisks(found.id);
@@ -1148,7 +1162,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           supplementList: z.string().optional().describe('Lista de suplementos a analizar (si no se proporciona, usa los del plan activo)'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           const supplements = params.supplementList
             ? params.supplementList.split(',').map(s => s.trim())
@@ -1183,7 +1198,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           studentName: z.string().describe('Nombre del alumno'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           try {
             const alerts = await fetchSupplementAlerts(found.id);
@@ -1216,7 +1232,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           bodyFatConfidence: z.enum(['low', 'medium', 'high']).optional().describe('Nivel de confianza de la estimación'),
         }),
         async execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado. Alumnos disponibles: ' + students.map(s => s.name).join(', ');
           try {
             let findingsObj: Record<string, string> = {};
@@ -1248,7 +1265,8 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
           currentPlanSummary: z.string().describe('Resumen del plan actual (calorías, macros, suplementos)'),
         }),
         execute(params) {
-          const found = students.find(s => s.name.toLowerCase().includes(params.studentName.toLowerCase()));
+          const { match: found, ambiguous } = resolveStudentByName(params.studentName, students);
+          if (!found && ambiguous.length > 1) return 'Nombre ambiguo, hay varios alumnos que coinciden: ' + ambiguous.map(s => s.name).join(', ') + '. Pregunta al coach cuál es antes de continuar.';
           if (!found) return 'Alumno no encontrado';
           return JSON.stringify({
             studentName: found.name,
@@ -1484,6 +1502,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
       await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
       const recording = new Audio.Recording();
       await recording.prepareToRecordAsync({
+        isMeteringEnabled: true,
         android: {
           extension: '.m4a',
           outputFormat: 2,
@@ -1603,6 +1622,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
       await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
       const recording = new Audio.Recording();
       await recording.prepareToRecordAsync({
+        isMeteringEnabled: true,
         android: {
           extension: '.m4a',
           outputFormat: 2,
@@ -1815,6 +1835,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         if (!streaming && msgs.length > prevLength && growing) {
           console.log('[VoiceAPI] Response complete after', pollCount, 'polls (', Date.now() - startTime, 'ms). Preview:', growing.substring(0, 100));
           clearInterval(checkInterval);
+          clearTimeout(safetyTimeout);
           emitNewSentences(growing, true);
           resolve(growing);
           return;
@@ -1825,8 +1846,9 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
         }
       }, 250);
 
-      // Safety timeout: 45 seconds
-      setTimeout(() => {
+      // Safety timeout: 45 seconds. Cancelled when the poll resolves normally
+      // so it doesn't stay pending for the rest of the session.
+      const safetyTimeout = setTimeout(() => {
         clearInterval(checkInterval);
         console.log('[VoiceAPI] TIMEOUT after 45s — resolving with fallback');
         const msgs = messagesRef.current;
@@ -2013,7 +2035,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
 
   const handleDraftSave = useCallback((plan: DraftNutritionPlan) => {
     const studentName = plan.studentName;
-    const found = studentName ? students.find(s => s.name.toLowerCase().includes(studentName.toLowerCase())) : null;
+    const found = studentName ? resolveStudentByName(studentName, students).match : null;
     if (found) {
       const planId = plan.documentId;
       const meals: Meal[] = plan.meals.map(m => ({
@@ -2023,7 +2045,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
       }));
       const nutritionPlan: NutritionPlan = {
         id: planId, studentId: found.id, title: plan.title,
-        currentWeight: plan.currentWeight ? parseFloat(plan.currentWeight) : undefined,
+        currentWeight: plan.currentWeight ? parseNum(plan.currentWeight) : undefined,
         weeklyGoal: plan.weeklyGoal, metabolicStrategy: plan.metabolicStrategy,
         calories: plan.calories, protein: plan.protein, carbs: plan.carbs, fats: plan.fats,
         unitSystem: plan.unitSystem, meals, supplements: plan.supplements || [],
@@ -2062,7 +2084,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
       id: plan.documentId,
       studentId: 'draft',
       title: plan.title,
-      currentWeight: plan.currentWeight ? parseFloat(plan.currentWeight) : undefined,
+      currentWeight: plan.currentWeight ? parseNum(plan.currentWeight) : undefined,
       weeklyGoal: plan.weeklyGoal,
       metabolicStrategy: plan.metabolicStrategy,
       calories: plan.calories,
@@ -2089,7 +2111,7 @@ RESPUESTA: Estructurada, profesional, sin jerga innecesaria. Las estimaciones vi
       age: 0,
       gender: 'male',
       height: 0,
-      weight: plan.currentWeight ? parseFloat(plan.currentWeight) : 0,
+      weight: plan.currentWeight ? parseNum(plan.currentWeight) : 0,
       activityLevel: 'moderate',
       goal: 'competition',
       notes: '',

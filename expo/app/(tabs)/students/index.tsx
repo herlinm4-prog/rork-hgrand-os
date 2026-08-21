@@ -34,7 +34,7 @@ import { useTheme } from '@/contexts/ThemeContext';
 import { useStudents, useFilteredStudents } from '@/contexts/StudentsContext';
 import StudentCard from '@/components/StudentCard';
 import { ActivityLevel, FitnessGoal, ACTIVITY_LABELS, GOAL_LABELS } from '@/types';
-import { calculateBMR, calculateTDEE } from '@/utils/calculations';
+import { calculateBMR, calculateTDEE, parseNum } from '@/utils/calculations';
 
 const BLOOD_TYPES = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'] as const;
 
@@ -301,10 +301,10 @@ export default function StudentsScreen() {
       return;
     }
 
-    const weight = parseFloat(newWeight);
-    const height = parseFloat(newHeight);
+    const weight = parseNum(newWeight);
+    const height = parseNum(newHeight);
     const age = parseInt(newAge, 10);
-    const bodyFat = newBodyFat ? parseFloat(newBodyFat) : (newGender === 'male' ? 15 : 25);
+    const bodyFat = newBodyFat ? parseNum(newBodyFat) : (newGender === 'male' ? 15 : 25);
     const bmr = calculateBMR(weight, bodyFat);
     const tdee = calculateTDEE(bmr, newActivity);
 
@@ -327,13 +327,13 @@ export default function StudentsScreen() {
       gender: newGender,
       height,
       weight,
-      goalWeight: newGoalWeight ? parseFloat(newGoalWeight) : undefined,
+      goalWeight: newGoalWeight ? parseNum(newGoalWeight) : undefined,
       activityLevel: newActivity,
       goal: newGoal,
       notes: newNotes.trim(),
       bmr,
       tdee,
-      bodyFatPercentage: newBodyFat ? parseFloat(newBodyFat) : undefined,
+      bodyFatPercentage: newBodyFat ? parseNum(newBodyFat) : undefined,
       occupation: newOccupation.trim() || undefined,
       emergencyContact,
       medicalConditions: newMedicalConditions.length > 0 ? newMedicalConditions : undefined,

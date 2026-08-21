@@ -48,6 +48,7 @@ import {
   FoodItem,
   NutritionPlan,
 } from '@/types';
+import { parseNum } from '@/utils/calculations';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -228,7 +229,7 @@ export function DraftDocumentCard({
   }, []);
 
   const updateFoodQuantity = useCallback((mealId: string, foodId: string, rawQty: string) => {
-    const num = parseFloat(rawQty) || 0;
+    const num = parseNum(rawQty) || 0;
     setDraft(prev => ({
       ...prev,
       meals: prev.meals.map(m => {

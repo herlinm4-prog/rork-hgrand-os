@@ -1,5 +1,6 @@
 import { NutritionPlan, NutritionDay, Student, Meal, FoodItem, CardioSection, MealObjective, MEAL_OBJECTIVE_LABELS } from '@/types';
 import { DocumentSettings } from '@/types/settings';
+import { escapeHtml, safeImageUri } from '@/utils/sanitize';
 
 // ── Unit conversion ───────────────────────────────────────────
 const G_TO_OZ = 1 / 28.3495;
@@ -45,7 +46,7 @@ function buildLogoHtml(settings: DocumentSettings): string {
 
   return `
     <div style="text-align:${align};margin-bottom:20px;">
-      <img src="${settings.logoUri}" style="width:${sizePx}px;height:${sizePx}px;object-fit:contain;opacity:${opacity};border-radius:${shape};" />
+      <img src="${safeImageUri(settings.logoUri)}" style="width:${sizePx}px;height:${sizePx}px;object-fit:contain;opacity:${opacity};border-radius:${shape};" />
     </div>
   `;
 }
@@ -83,7 +84,7 @@ function buildCardioHtml(cardio: CardioSection): string {
   };
 
   const lines: string[] = [];
-  lines.push(`<span class="food-qty">• ${cardio.durationMinutes} minutos</span><span class="food-name">${cardio.type || 'Cardio'}</span>`);
+  lines.push(`<span class="food-qty">• ${cardio.durationMinutes} minutos</span><span class="food-name">${escapeHtml(cardio.type || 'Cardio')}</span>`);
 
   if (cardio.heartRateMin && cardio.heartRateMax) {
     lines.push(`<span class="food-qty">• ${cardio.heartRateMin}–${cardio.heartRateMax} bpm</span><span class="food-name">Zona de frecuencia cardíaca</span>`);
@@ -261,7 +262,7 @@ export function generateHgrandNutritionPdfHtml(
       const foodsHtml = meal.foods.map(f => {
         const qtyText = getWeightLabel(f, isImperial);
         const macrosLine = `${f.calories || 0} kcal · ${Math.round((f.protein || 0) * 10) / 10}p · ${Math.round((f.carbs || 0) * 10) / 10}c · ${Math.round((f.fats || 0) * 10) / 10}g`;
-        return `<div class="food-line"><span class="food-bullet">•</span><span class="food-qty">${qtyText}</span><span class="food-name">${f.name}</span><span class="food-macros">${macrosLine}</span></div>`;
+        return `<div class="food-line"><span class="food-bullet">•</span><span class="food-qty">${escapeHtml(qtyText)}</span><span class="food-name">${escapeHtml(f.name)}</span><span class="food-macros">${macrosLine}</span></div>`;
       }).join('');
 
       const objectiveDesc = getObjectiveDescription(meal.objective, meal.objectiveText);
@@ -279,7 +280,7 @@ export function generateHgrandNutritionPdfHtml(
 
       return `
         <div class="meal-block">
-          <div class="meal-title">${meal.name || `COMIDA ${mi + 1}`}${meal.time ? ` — ${meal.time}` : ''}</div>
+          <div class="meal-title">${escapeHtml(meal.name || `COMIDA ${mi + 1}`)}${meal.time ? ` — ${escapeHtml(meal.time)}` : ''}</div>
           <div class="meal-foods">
             ${foodsHtml}
           </div>
@@ -311,10 +312,10 @@ export function generateHgrandNutritionPdfHtml(
       ${plan.supplements.map(s => `
         <div class="food-line">
           <span class="food-bullet">•</span>
-          <span class="food-qty">${s.dosage || ''}</span>
-          <span class="food-name">${s.name}${s.timing ? ` — ${s.timing}` : ''}</span>
+          <span class="food-qty">${escapeHtml(s.dosage || '')}</span>
+          <span class="food-name">${escapeHtml(s.name)}${s.timing ? ` — ${escapeHtml(s.timing)}` : ''}</span>
         </div>
-        ${s.notes ? `<div class="supplement-note">${s.notes}</div>` : ''}
+        ${s.notes ? `<div class="supplement-note">${escapeHtml(s.notes)}</div>` : ''}
       `).join('')}
     </div>
   ` : '';

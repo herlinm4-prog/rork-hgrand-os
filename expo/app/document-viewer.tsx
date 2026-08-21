@@ -62,6 +62,7 @@ import {
   formatFileSize,
   type DocumentViewerType,
 } from '@/utils/documentService';
+import { escapeHtml, sanitizeDocumentHtml } from '@/utils/sanitize';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -346,7 +347,7 @@ export default function DocumentViewerScreen() {
           blockquote { border-left: 3px solid #6C8EFF; padding-left: 12px; margin: 12px 0; color: ${isDarkMode ? '#aaa' : '#666'}; }
         </style>
       </head>
-      <body>${html}</body>
+      <body>${safeHtml}</body>
       </html>
     `;
   }, []);
@@ -354,11 +355,15 @@ export default function DocumentViewerScreen() {
   const getTextContentViewer = useCallback((text: string, title: string, isDarkMode: boolean) => {
     const bg = isDarkMode ? '#1a1a2e' : '#FAFBFC';
     const textColor = isDarkMode ? '#e0e0e0' : '#1a1a1a';
-    const escapedText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+    const escapedText = escapeHtml(text).replace(/\n/g, '<br>');
+    // The document name is user/AI supplied and was previously interpolated
+    // raw — a document called `<img onerror=...>` executed in the WebView.
+    const escapedTitle = escapeHtml(title);
     return `
       <!DOCTYPE html>
       <html>
       <head>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
           * { box-sizing: border-box; }
@@ -369,7 +374,7 @@ export default function DocumentViewerScreen() {
         </style>
       </head>
       <body>
-        <div class="doc-title">${title}</div>
+        <div class="doc-title">${escapedTitle}</div>
         <div class="doc-content">${escapedText}</div>
       </body>
       </html>
@@ -795,7 +800,15 @@ export default function DocumentViewerScreen() {
                     <WebView
                       source={{ html: getHtmlContentViewer(document.htmlContent, isDark) }}
                       style={styles.webView}
-                      javaScriptEnabled
+                      // Document HTML is untrusted (AI-generated or imported):
+                      // no JS, no local file access, and no navigating away to
+                      // an attacker-controlled page.
+                      javaScriptEnabled={false}
+                      allowFileAccess={false}
+                      allowFileAccessFromFileURLs={false}
+                      allowUniversalAccessFromFileURLs={false}
+                      originWhitelist={['about:']}
+                      onShouldStartLoadWithRequest={(req) => req.url === 'about:blank'}
                       scalesPageToFit={false}
                       showsVerticalScrollIndicator
                     />
@@ -805,6 +818,7 @@ export default function DocumentViewerScreen() {
                 Platform.OS === 'web' ? (
                   <View style={styles.webViewInner}>
                     <iframe
+                      sandbox=""
                       srcDoc={getTextContentViewer(document.content, document.name, isDark)}
                       style={{ width: '100%', height: '100%', border: 'none' } as any}
                     />
@@ -814,7 +828,13 @@ export default function DocumentViewerScreen() {
                     <WebView
                       source={{ html: getTextContentViewer(document.content, document.name, isDark) }}
                       style={styles.webView}
-                      javaScriptEnabled
+                      // Plain-text viewer: nothing here needs scripting.
+                      javaScriptEnabled={false}
+                      allowFileAccess={false}
+                      allowFileAccessFromFileURLs={false}
+                      allowUniversalAccessFromFileURLs={false}
+                      originWhitelist={['about:']}
+                      onShouldStartLoadWithRequest={(req) => req.url === 'about:blank'}
                       scalesPageToFit={false}
                       showsVerticalScrollIndicator
                     />

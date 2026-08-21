@@ -53,6 +53,7 @@ import {
   validateSkinfold,
   PARRILLO_VERSION,
 } from '@/utils/parrillo';
+import { parseNum } from '@/utils/calculations';
 
 type SkinfoldState = Record<keyof Skinfolds9, string>;
 
@@ -128,22 +129,22 @@ export default function NewCheckInScreen() {
   const allSkinfoldsValid = useMemo(() => {
     return SKINFOLD_KEYS.every((key) => {
       const val = skinfolds[key];
-      return val.trim() !== '' && !isNaN(parseFloat(val)) && parseFloat(val) > 0;
+      return val.trim() !== '' && !isNaN(parseNum(val)) && parseNum(val) > 0;
     });
   }, [skinfolds]);
 
   const parrilloResult = useMemo(() => {
     if (bodyFatMethod !== 'parrillo_9_site' || !allSkinfoldsValid || !student) return null;
     const numericSkinfolds: Skinfolds9 = {
-      chest: parseFloat(skinfolds.chest),
-      abdomen: parseFloat(skinfolds.abdomen),
-      thigh: parseFloat(skinfolds.thigh),
-      triceps: parseFloat(skinfolds.triceps),
-      subscapular: parseFloat(skinfolds.subscapular),
-      suprailiac: parseFloat(skinfolds.suprailiac),
-      lowerBack: parseFloat(skinfolds.lowerBack),
-      calf: parseFloat(skinfolds.calf),
-      biceps: parseFloat(skinfolds.biceps),
+      chest: parseNum(skinfolds.chest),
+      abdomen: parseNum(skinfolds.abdomen),
+      thigh: parseNum(skinfolds.thigh),
+      triceps: parseNum(skinfolds.triceps),
+      subscapular: parseNum(skinfolds.subscapular),
+      suprailiac: parseNum(skinfolds.suprailiac),
+      lowerBack: parseNum(skinfolds.lowerBack),
+      calf: parseNum(skinfolds.calf),
+      biceps: parseNum(skinfolds.biceps),
     };
     return calculateParrillo9(student.gender, numericSkinfolds);
   }, [bodyFatMethod, allSkinfoldsValid, skinfolds, student]);
@@ -152,8 +153,8 @@ export default function NewCheckInScreen() {
     const warnings: Partial<Record<keyof Skinfolds9, string>> = {};
     SKINFOLD_KEYS.forEach((key) => {
       const val = skinfolds[key];
-      if (val.trim() !== '' && !isNaN(parseFloat(val))) {
-        const result = validateSkinfold(parseFloat(val));
+      if (val.trim() !== '' && !isNaN(parseNum(val))) {
+        const result = validateSkinfold(parseNum(val));
         if (result.warning) warnings[key] = result.warning;
       }
     });
@@ -227,7 +228,7 @@ export default function NewCheckInScreen() {
     let sexUsed: 'male' | 'female' | undefined;
 
     if (bodyFatMethod === 'bia') {
-      finalBodyFat = bodyFat ? parseFloat(bodyFat) : undefined;
+      finalBodyFat = bodyFat ? parseNum(bodyFat) : undefined;
     } else if (bodyFatMethod === 'parrillo_9_site') {
       if (parrilloResult) {
         finalBodyFat = parrilloResult.bodyFatPercent;
@@ -235,18 +236,18 @@ export default function NewCheckInScreen() {
         calcVersion = parrilloResult.version;
         sexUsed = student?.gender;
         finalSkinfolds = {
-          chest: parseFloat(skinfolds.chest),
-          abdomen: parseFloat(skinfolds.abdomen),
-          thigh: parseFloat(skinfolds.thigh),
-          triceps: parseFloat(skinfolds.triceps),
-          subscapular: parseFloat(skinfolds.subscapular),
-          suprailiac: parseFloat(skinfolds.suprailiac),
-          lowerBack: parseFloat(skinfolds.lowerBack),
-          calf: parseFloat(skinfolds.calf),
-          biceps: parseFloat(skinfolds.biceps),
+          chest: parseNum(skinfolds.chest),
+          abdomen: parseNum(skinfolds.abdomen),
+          thigh: parseNum(skinfolds.thigh),
+          triceps: parseNum(skinfolds.triceps),
+          subscapular: parseNum(skinfolds.subscapular),
+          suprailiac: parseNum(skinfolds.suprailiac),
+          lowerBack: parseNum(skinfolds.lowerBack),
+          calf: parseNum(skinfolds.calf),
+          biceps: parseNum(skinfolds.biceps),
         };
       } else if (bodyFat) {
-        finalBodyFat = parseFloat(bodyFat);
+        finalBodyFat = parseNum(bodyFat);
       }
     }
 
@@ -255,7 +256,7 @@ export default function NewCheckInScreen() {
       await addCheckIn(studentId ?? '', {
         studentId: studentId ?? '',
         date: new Date().toISOString().split('T')[0],
-        weight: parseFloat(weight),
+        weight: parseNum(weight),
         bodyFatPercentage: finalBodyFat,
         bodyFatMethod,
         skinfolds9: finalSkinfolds,
@@ -266,16 +267,16 @@ export default function NewCheckInScreen() {
         sexUsedForCalc: sexUsed,
         photos,
         measurements: {
-          chest: chest ? parseFloat(chest) : undefined,
-          waist: waist ? parseFloat(waist) : undefined,
-          hips: hips ? parseFloat(hips) : undefined,
+          chest: chest ? parseNum(chest) : undefined,
+          waist: waist ? parseNum(waist) : undefined,
+          hips: hips ? parseNum(hips) : undefined,
         },
         notes: notes.trim(),
         coachFeedback: coachFeedback.trim() || undefined,
         mood,
-        sleepHours: sleepHours ? parseFloat(sleepHours) : undefined,
+        sleepHours: sleepHours ? parseNum(sleepHours) : undefined,
         sleepQuality,
-        waterIntake: waterIntake ? parseFloat(waterIntake) : undefined,
+        waterIntake: waterIntake ? parseNum(waterIntake) : undefined,
         stressLevel,
         energyLevel,
         digestiveHealth,

@@ -29,6 +29,7 @@ import Colors from '@/constants/colors';
 import { useTheme } from '@/contexts/ThemeContext';
 import { useStudents } from '@/contexts/StudentsContext';
 import { NutritionPlan, NutritionDay, Meal, FoodItem, Supplement } from '@/types';
+import { parseNum } from '@/utils/calculations';
 
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
@@ -179,7 +180,7 @@ export default function NutritionPlanEditor() {
   const updateObjective = useCallback((field: keyof NutritionDay['objectives'], value: string) => {
     setDays(prev => prev.map((d, i) => {
       if (i !== activeDayIndex) return d;
-      return { ...d, objectives: { ...d.objectives, [field]: parseFloat(value) || 0 } };
+      return { ...d, objectives: { ...d.objectives, [field]: parseNum(value) || 0 } };
     }));
     markChanged();
   }, [activeDayIndex, markChanged]);
@@ -253,7 +254,7 @@ export default function NutritionPlanEditor() {
           const updatedFoods = m.foods.map((f, fi) => {
             if (fi !== foodIndex) return f;
             if (field === 'name' || field === 'unit') return { ...f, [field]: value };
-            return { ...f, [field]: parseFloat(value) || 0 };
+            return { ...f, [field]: parseNum(value) || 0 };
           });
           return { ...m, foods: updatedFoods };
         }),

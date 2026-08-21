@@ -1,5 +1,6 @@
 import { NutritionPlan, NutritionDay, Student, TrainingPlan } from '@/types';
 import { DocumentSettings, LogoPosition, LogoSize, LogoShape, LogoBorderStyle, RequiredTip } from '@/types/settings';
+import { escapeHtml, safeImageUri } from '@/utils/sanitize';
 
 function getLogoSizePx(size: LogoSize): number {
   switch (size) {
@@ -46,7 +47,7 @@ function buildLogoHtml(settings: DocumentSettings): string {
 
   return `
     <div style="display:flex;justify-content:${align};align-items:center;margin-bottom:${mb}px;">
-      <img src="${settings.logoUri}" style="width:${sizePx}px;height:${sizePx}px;object-fit:contain;opacity:${opacity};${shape}${border}" />
+      <img src="${safeImageUri(settings.logoUri)}" style="width:${sizePx}px;height:${sizePx}px;object-fit:contain;opacity:${opacity};${shape}${border}" />
     </div>
   `;
 }
@@ -144,8 +145,8 @@ export function generateNutritionPlanPdfHtml(
   const headerHtml = showHeader ? `
     <div class="doc-header">
       ${topLogo}
-      <h1 class="doc-title">${plan.title || 'PLAN NUTRICIONAL'}</h1>
-      ${showAthleteInfo ? `<div class="doc-athlete">${student.name}</div>` : ''}
+      <h1 class="doc-title">${escapeHtml(plan.title || 'PLAN NUTRICIONAL')}</h1>
+      ${showAthleteInfo ? `<div class="doc-athlete">${escapeHtml(student.name)}</div>` : ''}
       ${showCoachInfo ? `<div class="doc-coach">Coach: ${docSettings.coachName}</div>` : ''}
       ${docSettings.headerStyle === 'full' ? `<div class="doc-date">${dateStr}</div>` : ''}
     </div>
@@ -156,11 +157,11 @@ export function generateNutritionPlanPdfHtml(
 
     const dayTitleHtml = planDays.length > 1 ? `
       <div class="day-divider">
-        <h2 class="day-title">${day.title}${day.subtitle ? ` — ${day.subtitle}` : ''}</h2>
+        <h2 class="day-title">${escapeHtml(day.title)}${day.subtitle ? ` — ${escapeHtml(day.subtitle)}` : ''}</h2>
       </div>
     ` : (day.subtitle ? `
       <div class="day-divider">
-        <h2 class="day-title">${day.subtitle}</h2>
+        <h2 class="day-title">${escapeHtml(day.subtitle)}</h2>
       </div>
     ` : '');
 
@@ -588,7 +589,7 @@ export function generateTrainingPlanPdfHtml(
       ${topLogo}
       <h1 class="doc-title">${plan.name || 'PLAN DE ENTRENAMIENTO'}</h1>
       ${plan.phase ? `<div class="doc-phase">${phaseLabels[plan.phase] || plan.phase}</div>` : ''}
-      ${showAthleteInfo ? `<div class="doc-athlete">${student.name}</div>` : ''}
+      ${showAthleteInfo ? `<div class="doc-athlete">${escapeHtml(student.name)}</div>` : ''}
       ${showCoachInfo ? `<div class="doc-coach">Coach: ${docSettings.coachName}</div>` : ''}
       ${docSettings.headerStyle === 'full' ? `<div class="doc-date">${dateStr}</div>` : ''}
     </div>

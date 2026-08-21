@@ -55,6 +55,7 @@ import type {
 } from '@/types';
 import { MEAL_OBJECTIVE_LABELS } from '@/types';
 import { generateHgrandNutritionPdfHtml } from '@/utils/nutritionPdfGenerator';
+import { parseNum } from '@/utils/calculations';
 
 // ── Helpers ─────────────────────────────────────────────────────
 function generateId() {
@@ -257,15 +258,15 @@ export default function MealPlanBuilderScreen() {
       Alert.alert('Falta el nombre', 'Escribe el nombre del alimento.');
       return;
     }
-    if (!customFood.quantity || parseFloat(customFood.quantity) <= 0) {
+    if (!customFood.quantity || parseNum(customFood.quantity) <= 0) {
       Alert.alert('Falta la cantidad', 'Indica la cantidad en gramos u onzas.');
       return;
     }
-    const cq = parseFloat(customFood.quantity) || 0;
-    const cc = parseFloat(customFood.calories) || 0;
-    const cp = parseFloat(customFood.protein) || 0;
-    const ccab = parseFloat(customFood.carbs) || 0;
-    const cf = parseFloat(customFood.fats) || 0;
+    const cq = parseNum(customFood.quantity) || 0;
+    const cc = parseNum(customFood.calories) || 0;
+    const cp = parseNum(customFood.protein) || 0;
+    const ccab = parseNum(customFood.carbs) || 0;
+    const cf = parseNum(customFood.fats) || 0;
     const newFood: MealPlanFood = {
       id: generateId(),
       name: customFood.name.trim(),
@@ -374,7 +375,7 @@ export default function MealPlanBuilderScreen() {
   }, []);
 
   const updateFoodQuantity = useCallback((mealId: string, foodIdx: number, quantity: string) => {
-    const num = parseFloat(quantity) || 0;
+    const num = parseNum(quantity) || 0;
     setMeals(prev => prev.map(m => {
       if (m.id !== mealId) return m;
       return {
@@ -419,7 +420,7 @@ export default function MealPlanBuilderScreen() {
     id: existingPlan?.id || generateId(),
     studentId: studentId || '',
     title,
-    currentWeight: parseFloat(currentWeight) || undefined,
+    currentWeight: parseNum(currentWeight) || undefined,
     weeklyGoal: weeklyGoal || undefined,
     metabolicStrategy: metabolicStrategy || undefined,
     calories: parseInt(targetCalories) || 0,
@@ -458,8 +459,8 @@ export default function MealPlanBuilderScreen() {
     notes,
     createdAt: existingPlan?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    waterTarget: parseFloat(waterTarget) || undefined,
-    sodiumTarget: parseFloat(sodiumTarget) || undefined,
+    waterTarget: parseNum(waterTarget) || undefined,
+    sodiumTarget: parseNum(sodiumTarget) || undefined,
   }), [
     existingPlan, studentId, title, currentWeight, weeklyGoal, metabolicStrategy,
     targetCalories, targetProtein, targetCarbs, targetFats, unitSystem,
